@@ -49,6 +49,8 @@ export type LatestUsage = {
 
 export type ReduceChatBlocksOptions = {
     goalStateMessages?: NormalizedMessage[]
+    /** Current and previous native roots of this HAPI conversation. */
+    rootThreadIds?: readonly string[]
 }
 
 function getLatestThreadGoal(normalized: NormalizedMessage[]): ThreadGoal | null {
@@ -112,6 +114,16 @@ export function reduceChatBlocks(
     agentState: AgentState | null | undefined,
     options: ReduceChatBlocksOptions = {}
 ): { blocks: ChatBlock[]; hasReadyEvent: boolean; latestUsage: LatestUsage | null; latestGoal: ThreadGoal | null } {
+    const rootThreadIds = new Set(options.rootThreadIds ?? [])
+    // Old provider transitions could persist a root trace as a child event.
+    // Ignore only proven root identities; trace-only genuine children remain visible.
+    normalized = normalized.filter(message => {
+        if (message.role !== 'event') return true
+        const event = message.content as Record<string, unknown>
+        if (!['agent-run-start', 'agent-run-update', 'agent-run-trace'].includes(String(event.type))) return true
+        const agentId = event.agentId ?? event.agent_id
+        return typeof agentId !== 'string' || !rootThreadIds.has(agentId)
+    })
     const permissionsById = getPermissions(agentState)
     const titleChangesByToolUseId = collectTitleChanges(normalized)
 

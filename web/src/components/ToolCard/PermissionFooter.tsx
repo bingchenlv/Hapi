@@ -241,7 +241,7 @@ export function PermissionFooter(props: {
                         />
                         <PermissionRowButton
                             label={t('tool.yesForSession')}
-                            tone="muted"
+                            tone="allow"
                             loading={loadingForSession}
                             disabled={props.disabled || loading !== null || loadingForSession}
                             onClick={() => codexApprove('approved_for_session')}

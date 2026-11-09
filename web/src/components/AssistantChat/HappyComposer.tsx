@@ -40,7 +40,7 @@ import { useActiveSuggestions } from '@/hooks/useActiveSuggestions'
 import { applySuggestion } from '@/utils/applySuggestion'
 import { usePlatform } from '@/hooks/usePlatform'
 import { usePWAInstall } from '@/hooks/usePWAInstall'
-import { supportsEffort, supportsModelChange, PI_THINKING_LEVEL_LABELS } from '@hapi/protocol'
+import { supportsEffort, supportsModelChange, PI_THINKING_LEVEL_LABELS, isMiniMaxModel, isDeepSeekModel } from '@hapi/protocol'
 import type { PiThinkingLevel } from '@hapi/protocol'
 import { markSkillUsed } from '@/lib/recent-skills'
 import { useComposerDraft } from '@/hooks/useComposerDraft'
@@ -312,6 +312,7 @@ export function HappyComposer(props: {
     contextSize?: number
     contextCacheRead?: number
     contextWindow?: number | null
+    codexRateLimits?: import('@hapi/protocol/types').CodexRateLimits
     /** Model for the context-window heuristic; see StatusBar.contextModel. */
     contextModel?: string | null
     controlledByUser?: boolean
@@ -434,6 +435,7 @@ export function HappyComposer(props: {
         contextSize,
         contextCacheRead,
         contextWindow,
+        codexRateLimits,
         contextModel,
         controlledByUser = false,
         agentFlavor,
@@ -1093,10 +1095,11 @@ export function HappyComposer(props: {
             ? getCodexComposerReasoningEffortOptions(
                 modelReasoningEffort,
                 agentFlavor,
-                availableModelReasoningEffortOptions
+                availableModelReasoningEffortOptions,
+                isMiniMaxModel(model) || isDeepSeekModel(model)
             )
             : [],
-        [agentFlavor, modelReasoningEffort, availableModelReasoningEffortOptions]
+        [agentFlavor, model, modelReasoningEffort, availableModelReasoningEffortOptions]
     )
     // Pi: group models by provider for hierarchical display
     const piModelGroups = useMemo(
@@ -2343,6 +2346,7 @@ export function HappyComposer(props: {
                         contextSize={contextSize}
                         contextCacheRead={contextCacheRead}
                         contextWindow={contextWindow}
+                        codexRateLimits={codexRateLimits}
                         contextModel={contextModel}
                         model={model}
                         modelReasoningEffort={modelReasoningEffort}

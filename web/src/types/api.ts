@@ -69,6 +69,7 @@ export type {
     AttachmentMetadata,
     BackgroundTask,
     CodexCollaborationMode,
+    CodexRateLimits,
     CopilotAgentMode,
     Metadata,
     PermissionMode,
@@ -141,7 +142,8 @@ export type DecryptedMessage = ProtocolDecryptedMessage & {
     invokedAt?: number | null
     /**
      * Client-only: user force-dismissed an indeterminate queued row while the
-     * hub still reported busy. Hidden from QueuedMessagesBar but retained so a
+     * hub still reported busy. Its identifier is stored separately from the
+     * evictable transcript cache. Hidden from QueuedMessagesBar but retained so a
      * later messages-consumed SSE can mark it sent in the thread.
      */
     queueDismissed?: boolean

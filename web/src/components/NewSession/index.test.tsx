@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactElement } from 'react'
 import type { ApiClient } from '@/api/client'
-import type { AgentAvailabilityEntry, ClaudeModelSummary, Machine, PiModelSummary } from '@/types/api'
+import type { AgentAvailabilityEntry, ClaudeModelSummary, Machine, PiModelSummary, SessionSummary } from '@/types/api'
 import { queryKeys } from '@/lib/query-keys'
 import { saveNewSessionFormDraft } from './newSessionFormDraft'
 import {
@@ -14,6 +14,7 @@ import {
 } from './preferences'
 
 const mocks = vi.hoisted(() => ({
+    sessions: [] as SessionSummary[],
     spawnSession: vi.fn(),
     onSuccess: vi.fn(),
     notification: vi.fn(),
@@ -65,7 +66,7 @@ vi.mock('@/hooks/mutations/useSpawnSession', () => ({
     })
 }))
 vi.mock('@/hooks/queries/useSessions', () => ({
-    useSessions: () => ({ sessions: [], refetch: mocks.refetchSessions })
+    useSessions: () => ({ sessions: mocks.sessions, refetch: mocks.refetchSessions })
 }))
 vi.mock('@/hooks/useRecentPaths', () => ({
     useRecentPaths: () => ({
@@ -77,7 +78,7 @@ vi.mock('@/hooks/useRecentPaths', () => ({
 }))
 vi.mock('@/hooks/useMachinePathsExists', () => ({
     useMachinePathsExists: () => ({
-        pathExistence: { 'C:\\repo': mocks.directoryExists },
+        pathExistence: { 'C:\\repo': mocks.directoryExists, '/project': mocks.directoryExists },
         outsideWorkspaceRoots: new Set<string>(),
         checkPathsExists: mocks.checkPathsExists
     })
@@ -367,6 +368,7 @@ function renderWithQuery(ui: ReactElement) {
 
 describe('NewSession launch preferences', () => {
     beforeEach(() => {
+        mocks.sessions.splice(0)
         localStorage.clear()
         sessionStorage.clear()
         mocks.spawnSession.mockReset()
@@ -374,7 +376,7 @@ describe('NewSession launch preferences', () => {
         mocks.notification.mockReset()
         mocks.checkPathsExists.mockReset()
         mocks.checkPathsExists.mockImplementation(async () => ({
-            exists: { 'C:\\repo': mocks.directoryExists }
+            exists: { 'C:\\repo': mocks.directoryExists, '/project': mocks.directoryExists }
         }))
         mocks.availableAgents.splice(
             0,
@@ -407,6 +409,42 @@ describe('NewSession launch preferences', () => {
         mocks.refetchSessions.mockResolvedValue(undefined)
         mocks.addToast.mockReset()
         savePreferredAgent('codex')
+    })
+
+    function projectSource(): SessionSummary {
+        return { id: 'project-controller', active: false, metadata: { path: '/workspace', host: 'test', machineId: 'machine-1', flavor: 'codex',
+            project: { id: 'FF', name: '家庭记账', directory: '/project', controllerSessionId: 'project-controller', role: 'controller' } } } as unknown as SessionSummary
+    }
+
+    it('creates a project session with the existing model, reasoning and permission choices', async () => {
+        mocks.sessions.push(projectSource())
+        mocks.spawnSession.mockResolvedValue({ type: 'success', sessionId: 'project-created' })
+        savePreferredLaunchSettings('machine-1', 'codex', { model: 'gpt-5.6-sol', cursorSelectedBase: 'auto', effort: 'auto',
+            modelReasoningEffort: 'xhigh', permissionMode: 'default' })
+        renderWithQuery(<NewSession api={api} machines={[machine]} initialMachineId="machine-1" initialDirectory="/project"
+            initialProjectSessionId="project-controller" onSuccess={mocks.onSuccess} onCancel={() => {}} />)
+        expect(screen.getByLabelText('newSession.project')).toHaveValue('FF')
+        await waitFor(() => expect(screen.getByTestId('create')).toBeEnabled())
+        fireEvent.click(screen.getByTestId('create'))
+        await waitFor(() => expect(mocks.spawnSession).toHaveBeenCalled())
+        expect(mocks.spawnSession.mock.calls[0][0]).toMatchObject({ sourceProjectSessionId: 'project-controller', directory: '/project',
+            agent: 'codex', model: 'gpt-5.6-sol', modelReasoningEffort: 'xhigh', permissionMode: 'default' })
+        expect(mocks.sessions[0].metadata?.path).toBe('/workspace')
+    })
+
+    it('allows the global form to select a project or keep an independent session', async () => {
+        mocks.sessions.push(projectSource())
+        mocks.spawnSession.mockResolvedValue({ type: 'success', sessionId: 'plain-created' })
+        renderWithQuery(<NewSession api={api} machines={[machine]} initialMachineId="machine-1" initialDirectory="/project"
+            onSuccess={mocks.onSuccess} onCancel={() => {}} />)
+        const select = screen.getByLabelText('newSession.project')
+        fireEvent.change(select, { target: { value: 'FF' } })
+        expect(select).toHaveValue('FF')
+        fireEvent.change(select, { target: { value: '' } })
+        await waitFor(() => expect(screen.getByTestId('create')).toBeEnabled())
+        fireEvent.click(screen.getByTestId('create'))
+        await waitFor(() => expect(mocks.spawnSession).toHaveBeenCalled())
+        expect(mocks.spawnSession.mock.calls[0][0].sourceProjectSessionId).toBeUndefined()
     })
 
     it('hides unavailable Agents and falls back to the first available Agent', async () => {

@@ -11,6 +11,7 @@ import { useSteerQueuedMessage } from '@/hooks/mutations/useSteerQueuedMessage'
 import { useRetryIndeterminateMessage } from '@/hooks/mutations/useRetryIndeterminateMessage'
 import { useTranslation } from '@/lib/use-translation'
 import { useToast } from '@/lib/toast-context'
+import { getQueuedDismissalClearFailed, QueueDismissalStorageError, subscribeQueuedDismissalClearFailure } from '@/lib/queued-dismissals'
 import type { PendingSchedule } from '@/components/AssistantChat/ScheduleTimePicker'
 import { formatScheduledTime } from '@/lib/scheduledTime'
 import {
@@ -231,6 +232,11 @@ export function QueuedMessagesBar({
     const retryMutation = useRetryIndeterminateMessage(api)
     const { t } = useTranslation()
     const { addToast } = useToast()
+    const dismissalClearFailed = useSyncExternalStore(
+        useCallback((listener) => subscribeQueuedDismissalClearFailure(sessionId, listener), [sessionId]),
+        useCallback(() => getQueuedDismissalClearFailed(sessionId), [sessionId]),
+        () => false
+    )
     const pendingScheduleRef = useRef(pendingSchedule)
     const pendingScheduleRevisionRef = useRef(pendingScheduleRevision)
     const composerTextRef = useRef(composerText)
@@ -330,9 +336,14 @@ export function QueuedMessagesBar({
         }
     }, [restoreQueuedEditRecovery, sessionId])
 
-    if (queued.length === 0) {
-        return null
-    }
+    // A consumed/off-window row may leave no cards, but storage failure must
+    // remain visible. This warning is not a failed delivery or a retry action.
+    const dismissalClearWarning = dismissalClearFailed ? (
+        <div role="alert" className="mx-auto w-full max-w-content px-3 pt-2 text-sm text-[var(--app-warning-text)]">
+            {t('queuedMessages.dismissClearStorageFailed')}
+        </div>
+    ) : null
+    if (queued.length === 0) return dismissalClearWarning
 
     return (
         <div
@@ -340,6 +351,7 @@ export function QueuedMessagesBar({
             aria-label={`${queued.length} queued message${queued.length === 1 ? '' : 's'} pending invocation`}
             className="mx-auto w-full max-w-content"
         >
+            {dismissalClearWarning}
             <div className="px-3 pb-0 pt-2 text-sm text-[var(--app-fg-muted)]">
                 <div className="flex items-center gap-1.5 mb-1.5 text-xs font-medium text-[var(--app-hint)]">
                     <ClockIcon />
@@ -371,8 +383,10 @@ export function QueuedMessagesBar({
                                 messageId: msg.id,
                                 localId,
                                 snapshot: msg,
-                            }).catch(() => {
-                                // useCancelQueuedMessage restores the optimistic row and gives haptic feedback.
+                            }).catch((error: unknown) => {
+                                if (error instanceof QueueDismissalStorageError) {
+                                    addToast({ title: t('queuedMessages.dismissStorageFailed'), body: '', sessionId, url: window.location.href })
+                                }
                             }).finally(() => {
                                 endQueuedOperation(sessionId, token)
                             })
@@ -507,8 +521,10 @@ export function QueuedMessagesBar({
                                     assistantApi.composer().setText(editText)
                                 }
                                 onEdit?.({ text: editText, pendingSchedule: restoredPendingSchedule })
-                            } catch {
-                                // useCancelQueuedMessage restores the optimistic row and gives haptic feedback.
+                            } catch (error: unknown) {
+                                if (error instanceof QueueDismissalStorageError) {
+                                    addToast({ title: t('queuedMessages.dismissStorageFailed'), body: '', sessionId, url: window.location.href })
+                                }
                             } finally {
                                 endQueuedOperation(sessionId, token)
                             }

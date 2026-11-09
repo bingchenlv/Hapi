@@ -1,3 +1,4 @@
+import { groupSessionsByProjectOrDirectory as groupSessionsByDirectory, type SessionGroup } from '@/lib/groupSessions'
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import * as Popover from '@radix-ui/react-popover'
 import { SessionListScrollAnchor } from './SessionListScrollAnchor'
@@ -152,17 +153,6 @@ export type SessionToolbarExtra = {
 
 export { getWorktreeSessionLabel } from '@/lib/sessionWorktreeLabel'
 
-type SessionGroup = {
-    key: string
-    directory: string
-    displayName: string
-    machineId: string | null
-    sessions: SessionSummary[]
-    latestOrderAt: number
-    hasActiveSession: boolean
-    hasPinnedSession: boolean
-}
-
 const MIN_CONTENT_SEARCH_QUERY_LENGTH = 2
 
 const RUNNING_BUCKETS = [
@@ -195,7 +185,7 @@ export function bucketRunningSessions(
         return buckets
     }
     for (const session of sessions) {
-        if (session.globalPinned || session.pinned) {
+        if (session.globalPinned || session.pinned || session.metadata?.project) {
             continue
         }
         if (!session.active) {
@@ -226,7 +216,7 @@ export function bucketRunningSessions(
  * conversation; only disconnected sessions fall into directory groups.
  */
 function isPinnedInProgressSession(session: SessionSummary): boolean {
-    return session.active
+    return session.active && !session.metadata?.project
 }
 
 function SessionsEmptyState(props: {
@@ -384,71 +374,6 @@ export function getPreviousSessionVisibleCount(current: number, step: number): n
     const normalizedStep = Math.max(1, step)
     return Math.max(normalizedStep, current - normalizedStep)
 }
-
-// Without a view this is the long-standing order: by the user's last message,
-// so agent output and liveness never reorder the list.
-const LEGACY_LIST_ORDER: Pick<SessionListView, 'sort' | 'activeFirst'> = { sort: 'last-message', activeFirst: false }
-
-export function groupSessionsByDirectory(
-    sessions: SessionSummary[],
-    order: Pick<SessionListView, 'sort' | 'activeFirst'> = LEGACY_LIST_ORDER
-): SessionGroup[] {
-    const compare = createSessionComparator(order)
-    const groups = new Map<string, { directory: string; machineId: string | null; sessions: SessionSummary[] }>()
-
-    sessions.forEach(session => {
-        const path = getSessionProjectPath(session.metadata) ?? 'Other'
-        const machineId = session.metadata?.machineId ?? null
-        const key = `${machineId ?? UNKNOWN_MACHINE_ID}::${path}`
-        if (!groups.has(key)) {
-            groups.set(key, {
-                directory: path,
-                machineId,
-                sessions: []
-            })
-        }
-        groups.get(key)!.sessions.push(session)
-    })
-
-    return Array.from(groups.entries())
-        .map(([key, group]) => {
-            const sortedSessions = [...group.sessions].sort((a, b) => {
-                if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1
-                return compare(a, b)
-            })
-            const latestOrderAt = group.sessions.reduce(
-                (max, s) => Math.max(max, getSessionSortKey(s, order.sort)),
-                -Infinity
-            )
-            const hasActiveSession = group.sessions.some(s => s.active)
-            const hasPinnedSession = group.sessions.some(s => s.pinned)
-            const displayName = getSessionProjectLabel(group.directory)
-
-            return {
-                key,
-                directory: group.directory,
-                displayName,
-                machineId: group.machineId,
-                sessions: sortedSessions,
-                latestOrderAt,
-                hasActiveSession,
-                hasPinnedSession
-            }
-        })
-        .sort((a, b) => {
-            if (a.hasPinnedSession !== b.hasPinnedSession) {
-                return a.hasPinnedSession ? -1 : 1
-            }
-            if (order.activeFirst && a.hasActiveSession !== b.hasActiveSession) {
-                return a.hasActiveSession ? -1 : 1
-            }
-            return compareDescWithKeyTiebreak(
-                { key: a.key, order: a.latestOrderAt },
-                { key: b.key, order: b.latestOrderAt }
-            )
-        })
-}
-
 
 export function expandSelectedSessionCollapseOverrides(
     overrides: Map<string, boolean>,
@@ -1067,7 +992,7 @@ const SessionItem = memo(function SessionItem(props: {
                 )
             }
         } catch (error) {
-            onError(formatReopenError(error))
+            onError(formatReopenError(error, t('dialog.reopen.resourceBusy')))
         }
     }
 
@@ -1347,7 +1272,7 @@ export function SessionList(props: {
     sessions: SessionSummary[]
     onSelect: (sessionId: string, targetMessageId?: string, targetMessageQuery?: string) => void
     onNewSession: () => void
-    onNewSessionInDirectory?: (args: { machineId: string | null; directory: string }) => void
+    onNewSessionInDirectory?: (args: { machineId: string | null; directory: string; sourceProjectSessionId?: string }) => void
     onBrowse?: () => void
     onRefresh: () => Promise<unknown> | void
     isLoading: boolean
@@ -1672,7 +1597,7 @@ export function SessionList(props: {
         [visibleSessions, activeMachineFilter]
     )
     const globalPinnedSessions = useMemo(() => {
-        const pinned = machineFilteredSessions.filter((session) => Boolean(session.globalPinned))
+        const pinned = machineFilteredSessions.filter((session) => Boolean(session.globalPinned) && !session.metadata?.project)
         if (searchScoreIndex && hasTextQuery) {
             return sortSessionsBySearchRelevance(pinned, searchScoreIndex)
         }
@@ -1694,7 +1619,7 @@ export function SessionList(props: {
         () => {
             const grouped = groupSessionsByDirectory(
                 machineFilteredSessions.filter((session) => {
-                    if (session.globalPinned) return false
+                    if (session.globalPinned && !session.metadata?.project) return false
                     if (pinInProgressSessions && !session.pinned && isPinnedInProgressSession(session)) return false
                     return true
                 }),
@@ -1716,7 +1641,7 @@ export function SessionList(props: {
     // filter stays consistent.
     const allDirectoryGroups = useMemo(
         () => groupSessionsByDirectory(
-            machineFilteredSessions.filter((session) => !session.globalPinned),
+            machineFilteredSessions.filter((session) => !session.globalPinned || Boolean(session.metadata?.project)),
             listView
         ),
         [machineFilteredSessions, listView]
@@ -1927,7 +1852,7 @@ export function SessionList(props: {
             ? `${group.displayName} · ${resolveMachineLabel(group.machineId)}`
             : group.displayName
         return (
-            <div key={group.key} data-session-scroll-anchor>
+            <div key={group.key} data-session-scroll-anchor role={group.project ? 'group' : undefined} aria-label={group.project ? groupTitle : undefined}>
                 <div
                     className="group/project sticky top-0 z-10 flex items-center gap-2 bg-[var(--app-bg)] py-1.5 pl-2 pr-2 text-left rounded-lg transition-colors hover:bg-[var(--app-secondary-bg)] min-w-0 w-full select-none"
                     title={group.directory}
@@ -1943,7 +1868,8 @@ export function SessionList(props: {
                                 event.stopPropagation()
                                 onNewSessionInDirectory({
                                     machineId: group.machineId,
-                                    directory: group.directory
+                                    directory: group.directory,
+                                    ...(group.sourceProjectSessionId ? { sourceProjectSessionId: group.sourceProjectSessionId } : {})
                                 })
                             }}
                             className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] opacity-70 transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-link)] hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
@@ -2002,7 +1928,7 @@ export function SessionList(props: {
             ? `${group.displayName} · ${resolveMachineLabel(group.machineId)}`
             : group.displayName
         return (
-            <div key={group.key} data-session-scroll-anchor>
+            <div key={group.key} data-session-scroll-anchor role={group.project ? 'group' : undefined} aria-label={group.project ? groupTitle : undefined}>
                 <div
                     className="group/project sticky top-0 z-10 flex items-center gap-2 bg-[var(--app-bg)] py-1.5 pl-2 pr-2 text-left rounded-lg transition-colors hover:bg-[var(--app-secondary-bg)] cursor-pointer min-w-0 w-full select-none"
                     onClick={() => toggleGroup(group.key, isCollapsed)}
@@ -2020,7 +1946,8 @@ export function SessionList(props: {
                                 event.stopPropagation()
                                 onNewSessionInDirectory({
                                     machineId: group.machineId,
-                                    directory: group.directory
+                                    directory: group.directory,
+                                    ...(group.sourceProjectSessionId ? { sourceProjectSessionId: group.sourceProjectSessionId } : {})
                                 })
                             }}
                             className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] opacity-70 transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-link)] hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"

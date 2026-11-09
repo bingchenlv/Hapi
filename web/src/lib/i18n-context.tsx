@@ -1,8 +1,9 @@
 import { createContext, useEffect, useState, useCallback, type ReactNode } from 'react'
 import { getTelegramWebApp, isTelegramEnvironment } from '@/hooks/useTelegram'
 import { en, zhCN, ru } from './locales'
+import { resolveLocale, type Locale } from './localePreference'
 
-export type Locale = 'en' | 'zh-CN' | 'ru'
+export type { Locale } from './localePreference'
 
 export type Translations = Record<string, string>
 
@@ -104,11 +105,21 @@ export function applyLateTelegramLocale(
 }
 
 export function I18nProvider({ children }: { children: ReactNode }) {
-  const [locale, setLocaleState] = useState<Locale>(() => detectInitialLocale())
+  const [locale, setLocaleState] = useState<Locale>(() => {
+    let saved: string | null = null
+    try { saved = localStorage.getItem('hapi-lang') } catch { /* Storage may be unavailable in private webviews. */ }
+    const normalizedSaved = normalizeLocaleTag(saved)
+    if (normalizedSaved) return normalizedSaved
+    if (typeof window !== 'undefined') {
+      const telegramLocale = normalizeLocaleTag(getTelegramWebApp()?.initDataUnsafe?.user?.language_code)
+      if (telegramLocale) return telegramLocale
+    }
+    return resolveLocale(saved, typeof navigator !== 'undefined' && navigator.languages?.length ? navigator.languages : [typeof navigator !== 'undefined' ? navigator.language : 'zh-CN'])
+  })
 
   const setLocale = useCallback((newLocale: Locale) => {
     setLocaleState(newLocale)
-    localStorage.setItem('hapi-lang', newLocale)
+    try { localStorage.setItem('hapi-lang', newLocale) } catch { /* The current page can still honor the choice. */ }
     document.documentElement.lang = newLocale
   }, [])
 

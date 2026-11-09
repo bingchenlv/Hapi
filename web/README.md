@@ -2,6 +2,17 @@
 
 React Mini App / PWA for monitoring and controlling hapi sessions.
 
+## Bounded production build (local extension, 2026-10-23)
+
+The build prebundles the installed runtime dependencies into local, content-hashed
+ESM assets before Vite processes the application. Entries share chunks (including
+one React instance); no CDN, dependency upgrade or removed diagram/highlighting
+capability. `.local-vendor/manifest.json` records exact installed-input hashes.
+Run `bun run build` through the shared host's `server-hardening/runtime/heavy_task.py`
+entry when on this server. Raw child builds inherit the chat's OOM domain.
+Temporary prebundles are generated files, not an alternate source tree. Changes
+to dependency imports or the lockfile require a fresh prebundle before Vite.
+
 ## What it does
 
 - Session list with status, pending approvals, todos, and summaries.

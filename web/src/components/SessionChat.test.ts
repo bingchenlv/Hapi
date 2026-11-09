@@ -77,6 +77,12 @@ describe('applyModelChangeWithReasoningRollback', () => {
 })
 
 describe('shouldClearReasoningEffortForModelChange', () => {
+    it('preserves the source preference across a DeepSeek provider switch in either direction', () => {
+        for (const [previousModel, model] of [['gpt-6.1-terra','deepseek-flash'],['deepseek-v4-pro','gpt-6.1-terra']]) {
+            expect(shouldClearReasoningEffortForModelChange({agentFlavor:'codex', previousModel, model,
+                previousModelReasoningEffort:'ultra',codexModels:[]})).toBe(false)
+        }
+    })
     it('preserves an OpenCode effort for backend validation and rollback', () => {
         expect(shouldClearReasoningEffortForModelChange({
             agentFlavor: 'opencode',
