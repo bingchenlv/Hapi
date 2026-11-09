@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { renderHook, act, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
@@ -52,27 +52,8 @@ function makeSnapshot(overrides: Partial<DecryptedMessage> = {}): DecryptedMessa
 }
 
 describe('useCancelQueuedMessage', () => {
-    afterEach(() => { vi.restoreAllMocks() })
     beforeEach(() => {
         vi.clearAllMocks()
-        localStorage.clear()
-    })
-
-    it('restores the visible row when durable dismissal cannot be saved', async () => {
-        vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('quota') })
-        const api = {
-            cancelMessage: vi.fn().mockResolvedValue({ status: 'busy', localId: 'local-1' }),
-            getQueuedState: vi.fn(),
-        } as unknown as ApiClient
-        const snapshot = makeSnapshot({ deliveryState: 'indeterminate' })
-        const { result } = renderHook(() => useCancelQueuedMessage(api), { wrapper: createWrapper() })
-        await act(async () => {
-            await expect(result.current.mutateAsync({
-                sessionId: 'session-1', messageId: snapshot.id, localId: 'local-1', snapshot,
-            })).rejects.toThrow('Could not persist')
-        })
-        expect(storeMocks.appendOptimisticMessage).toHaveBeenCalledWith('session-1', snapshot)
-        expect(api.getQueuedState).not.toHaveBeenCalled()
     })
 
     it('restores an indeterminate held row when cancel returns busy for a normal queued message', async () => {

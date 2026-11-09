@@ -48,7 +48,8 @@ describe('spawn RPC result mapping', () => {
     it('maps a spawn that needs directory approval', () => {
         expect(mapSpawnRpcResult({ type: 'requestToApproveDirectoryCreation', directory: '/tmp/x' })).toEqual({
             type: 'error',
-            message: 'Directory creation requires approval: /tmp/x'
+            message: 'Directory creation requires approval: /tmp/x',
+            childStarted: false
         })
     })
 

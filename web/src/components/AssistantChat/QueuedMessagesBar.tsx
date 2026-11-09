@@ -11,7 +11,6 @@ import { useSteerQueuedMessage } from '@/hooks/mutations/useSteerQueuedMessage'
 import { useRetryIndeterminateMessage } from '@/hooks/mutations/useRetryIndeterminateMessage'
 import { useTranslation } from '@/lib/use-translation'
 import { useToast } from '@/lib/toast-context'
-import { getQueuedDismissalClearFailed, QueueDismissalStorageError, subscribeQueuedDismissalClearFailure } from '@/lib/queued-dismissals'
 import type { PendingSchedule } from '@/components/AssistantChat/ScheduleTimePicker'
 import { formatScheduledTime } from '@/lib/scheduledTime'
 import {
@@ -200,9 +199,12 @@ export function QueuedMessagesBar({
     pendingScheduleRevision,
     onEdit,
     canSteer,
+    deliveryActive = canSteer,
+    compactionPendingMessageIds,
 }: {
     sessionId: string
     api: ApiClient | null
+    compactionPendingMessageIds?: readonly string[]
     /** Current composer schedule, used only to guard an asynchronous edit restore. */
     pendingSchedule: PendingSchedule | null
     /** Monotonic per-session revision; schedule selections win over an async edit restore. */
@@ -215,10 +217,11 @@ export function QueuedMessagesBar({
     onEdit?: (params: { text: string; pendingSchedule: PendingSchedule | null }) => void
     /**
      * When true, each queued row gets a Steer button that delivers that
-     * message into the active turn (Pi native steer). The parent computes it
-     * as: pi flavor && session thinking && remote-controlled.
+     * message into a supported active remote turn.
      */
     canSteer?: boolean
+    /** An existing dispatch may still be confirming after new Steer admission closes. */
+    deliveryActive?: boolean
 }) {
     const queued = useQueuedMessages(sessionId)
     const assistantApi = useAui()
@@ -228,11 +231,6 @@ export function QueuedMessagesBar({
     const retryMutation = useRetryIndeterminateMessage(api)
     const { t } = useTranslation()
     const { addToast } = useToast()
-    const dismissalClearFailed = useSyncExternalStore(
-        useCallback((listener) => subscribeQueuedDismissalClearFailure(sessionId, listener), [sessionId]),
-        useCallback(() => getQueuedDismissalClearFailed(sessionId), [sessionId]),
-        () => false
-    )
     const pendingScheduleRef = useRef(pendingSchedule)
     const pendingScheduleRevisionRef = useRef(pendingScheduleRevision)
     const composerTextRef = useRef(composerText)
@@ -332,14 +330,9 @@ export function QueuedMessagesBar({
         }
     }, [restoreQueuedEditRecovery, sessionId])
 
-    // A consumed/off-window row may leave no cards, but storage failure must
-    // remain visible. This warning is not a failed delivery or a retry action.
-    const dismissalClearWarning = dismissalClearFailed ? (
-        <div role="alert" className="mx-auto w-full max-w-content px-3 pt-2 text-sm text-[var(--app-warning-text)]">
-            {t('queuedMessages.dismissClearStorageFailed')}
-        </div>
-    ) : null
-    if (queued.length === 0) return dismissalClearWarning
+    if (queued.length === 0) {
+        return null
+    }
 
     return (
         <div
@@ -347,7 +340,6 @@ export function QueuedMessagesBar({
             aria-label={`${queued.length} queued message${queued.length === 1 ? '' : 's'} pending invocation`}
             className="mx-auto w-full max-w-content"
         >
-            {dismissalClearWarning}
             <div className="px-3 pb-0 pt-2 text-sm text-[var(--app-fg-muted)]">
                 <div className="flex items-center gap-1.5 mb-1.5 text-xs font-medium text-[var(--app-hint)]">
                     <ClockIcon />
@@ -363,7 +355,11 @@ export function QueuedMessagesBar({
                         const editText = getQueuedMessageEditText(preview)
                         const hasAttachments = attachmentNames.length > 0
                         const localId = msg.localId ?? msg.id
-                        const isPending = cancelMutation.isPending || queuedOperationPending
+                        const waitingForCompaction = msg.deliveryState === 'indeterminate'
+                            && compactionPendingMessageIds?.includes(localId) === true
+                        const deliveryPending = msg.deliveryPending === true && deliveryActive === true
+                        const needsResolution = msg.deliveryState === 'indeterminate' && !deliveryPending
+                        const isPending = cancelMutation.isPending || queuedOperationPending || deliveryPending
                         const canCancel = computeCanCancel({ id: msg.id, localId: msg.localId, isPending })
 
                         const handleCancel = () => {
@@ -375,10 +371,8 @@ export function QueuedMessagesBar({
                                 messageId: msg.id,
                                 localId,
                                 snapshot: msg,
-                            }).catch((error: unknown) => {
-                                if (error instanceof QueueDismissalStorageError) {
-                                    addToast({ title: t('queuedMessages.dismissStorageFailed'), body: '', sessionId, url: window.location.href })
-                                }
+                            }).catch(() => {
+                                // useCancelQueuedMessage restores the optimistic row and gives haptic feedback.
                             }).finally(() => {
                                 endQueuedOperation(sessionId, token)
                             })
@@ -395,7 +389,8 @@ export function QueuedMessagesBar({
                             && canCancel
                         )
                         const steerPending = steerMutation.isPending
-                            && steerMutation.variables?.messageId === msg.id
+                            && steerMutation.variables?.sessionId === sessionId
+                            && steerMutation.variables.messageId === msg.id
                         const handleSteer = () => {
                             if (!canSteerRow) return
                             const token = beginQueuedOperation(sessionId)
@@ -413,7 +408,7 @@ export function QueuedMessagesBar({
                         const retryPending = retryMutation.isPending
                             && retryMutation.variables?.messageId === msg.id
                         const handleRetry = () => {
-                            if (msg.deliveryState !== 'indeterminate' || !canCancel) return
+                            if (!needsResolution || !canCancel) return
                             const token = beginQueuedOperation(sessionId)
                             if (!token) return
                             void retryMutation.mutateAsync({
@@ -512,10 +507,8 @@ export function QueuedMessagesBar({
                                     assistantApi.composer().setText(editText)
                                 }
                                 onEdit?.({ text: editText, pendingSchedule: restoredPendingSchedule })
-                            } catch (error: unknown) {
-                                if (error instanceof QueueDismissalStorageError) {
-                                    addToast({ title: t('queuedMessages.dismissStorageFailed'), body: '', sessionId, url: window.location.href })
-                                }
+                            } catch {
+                                // useCancelQueuedMessage restores the optimistic row and gives haptic feedback.
                             } finally {
                                 endQueuedOperation(sessionId, token)
                             }
@@ -534,9 +527,18 @@ export function QueuedMessagesBar({
                                             {text}
                                         </span>
                                     ) : null}
+                                    {steerPending && msg.deliveryState !== 'indeterminate' ? (
+                                        <div className="mt-1 flex items-center gap-1 text-xs text-[var(--app-hint)]">
+                                            <svg className="h-3 w-3 shrink-0 animate-spin motion-reduce:animate-none" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                                                <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
+                                                <path d="M12 2a10 10 0 0 1 10 10" />
+                                            </svg>
+                                            {t('queuedMessages.steerRequesting')}
+                                        </div>
+                                    ) : null}
                                     {msg.deliveryState === 'indeterminate' ? (
-                                        <div className="mt-1 text-xs text-[var(--app-warning-text)]">
-                                            {t('queuedMessages.steerOutcomeUnknown')}
+                                        <div className={`mt-1 text-xs ${waitingForCompaction ? 'text-[var(--app-hint)]' : 'text-[var(--app-warning-text)]'}`}>
+                                            {t(waitingForCompaction ? 'queuedMessages.compactionPending' : deliveryPending ? 'queuedMessages.deliveryPending' : 'queuedMessages.steerOutcomeUnknown')}
                                         </div>
                                     ) : null}
                                     {hasAttachments ? (
@@ -563,7 +565,7 @@ export function QueuedMessagesBar({
                                     )}
                                 </div>
                                 <div className="flex shrink-0 items-center gap-1">
-                                    {msg.deliveryState === 'indeterminate' ? (
+                                    {needsResolution && !waitingForCompaction ? (
                                         <button
                                             type="button"
                                             aria-label={t('queuedMessages.retryOutcome')}

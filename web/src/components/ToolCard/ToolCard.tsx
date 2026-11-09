@@ -19,32 +19,51 @@ import { getToolResultViewComponent } from '@/components/ToolCard/views/_results
 import { formatTaskChildLabel, TaskStateIcon } from '@/components/ToolCard/helpers'
 import { toolDurationMs } from '@/components/ToolCard/toolDuration'
 import { formatDuration, formatMessageTimestampTitle } from '@/chat/presentation'
-import type { TerminalToolDisplayMode } from '@/hooks/useTerminalToolDisplayMode'
+import { getToolGroupActionKind, isTerminalToolBlock } from '@/chat/toolGroups'
+import type { TerminalToolDisplayMode } from '@/hooks/useToolCardDisplayMode'
 import { usePointerFocusRing } from '@/hooks/usePointerFocusRing'
 import { getInputStringAny, truncate } from '@/lib/toolInputUtils'
+import { resolveToolNameAlias } from '@/components/ToolCard/toolNameAliases'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/lib/use-translation'
 import { TraceSection } from '@/components/ToolCard/trace'
 import { isSubagentToolName } from '@/chat/subagentTool'
 
 const ELAPSED_INTERVAL_MS = 1000
-const TERMINAL_RELATED_TOOL_NAMES = new Set(['Bash', 'CodexBash', 'shell_command', 'run_shell_command'])
+// Canonical spellings only; flavor ids resolve through resolveToolNameAlias.
+const TERMINAL_RELATED_TOOL_NAMES = new Set([
+    'Bash',
+    'CodexBash',
+    'shell_command',
+    'run_shell_command',
+    'Shell',
+    'run_command',
+    'execute_command',
+    'terminal',
+])
 
-export function shouldUseCompactTerminalToolCard(toolName: string, terminalToolDisplayMode: TerminalToolDisplayMode): boolean {
-    return TERMINAL_RELATED_TOOL_NAMES.has(toolName) && terminalToolDisplayMode === 'compact'
+export function shouldUseCompactTerminalToolCard(
+    toolName: string,
+    terminalToolDisplayMode: TerminalToolDisplayMode,
+    terminalTool = TERMINAL_RELATED_TOOL_NAMES.has(resolveToolNameAlias(toolName))
+): boolean {
+    return terminalTool && terminalToolDisplayMode === 'compact'
 }
 
 export function shouldShowInlineToolCardBody(
     toolName: string,
     presentationMinimal: boolean,
-    terminalToolDisplayMode: TerminalToolDisplayMode
+    terminalToolDisplayMode: TerminalToolDisplayMode,
+    terminalTool = TERMINAL_RELATED_TOOL_NAMES.has(resolveToolNameAlias(toolName))
 ): boolean {
     if (isSubagentToolName(toolName)) return false
-    if (TERMINAL_RELATED_TOOL_NAMES.has(toolName)) {
+    if (terminalTool) {
         return terminalToolDisplayMode === 'detailed'
     }
     return !presentationMinimal
 }
+
+export { isTerminalToolBlock }
 
 export function getToolTimingDetails(tool: ChatToolCall, now: number): {
     startedAt: number | null
@@ -57,7 +76,7 @@ export function getToolTimingDetails(tool: ChatToolCall, now: number): {
 
     const active = tool.state === 'running'
     const hasExecPair = tool.execStartedAt != null && tool.execCompletedAt != null
-    const startedAt = active || !hasExecPair
+    const startedAt = tool.startUnavailable ? null : active || !hasExecPair
         ? (tool.startedAt ?? tool.createdAt)
         : tool.execStartedAt
     const completedAt = active
@@ -286,7 +305,7 @@ function renderToolInput(block: ToolCallBlock, surface: 'inline' | 'dialog' = 'i
     }
 
     const commandArray = isObject(input) && Array.isArray(input.command) ? input.command : null
-    if ((toolName === 'CodexBash' || toolName === 'Bash') && (typeof commandArray?.[0] === 'string' || typeof input === 'object')) {
+    if (isTerminalToolBlock(block)) {
         const cmd = Array.isArray(commandArray)
             ? commandArray.filter((part) => typeof part === 'string').join(' ')
             : getInputStringAny(input, ['command', 'cmd'])
@@ -373,7 +392,7 @@ export function ToolDetailDialogContent(props: {
     const { t } = useTranslation()
     const toolName = props.block.tool.name
     const FullToolView = getToolFullViewComponent(toolName)
-    const ResultToolView = getToolResultViewComponent(toolName)
+    const ResultToolView = getToolResultViewComponent(toolName, props.block)
     const permission = props.block.tool.permission
     const isAskUserQuestion = isAskUserQuestionToolName(toolName)
     const isRequestUserInput = isRequestUserInputToolName(toolName)
@@ -434,11 +453,12 @@ function ToolCardInner(props: ToolCardProps) {
         ? getSubagentModel(props.block.children, getInputStringAny(props.block.tool.input, ['model']))
         : null
     const isCodexAgentCard = toolName === 'CodexAgent'
-    const useCompactTerminalCard = shouldUseCompactTerminalToolCard(toolName, props.terminalToolDisplayMode)
-    const showInline = shouldShowInlineToolCardBody(toolName, presentation.minimal, props.terminalToolDisplayMode)
-    const CompactToolView = showInline ? getToolViewComponent(toolName) : null
+    const isTerminalTool = isTerminalToolBlock(props.block)
+    const useCompactTerminalCard = shouldUseCompactTerminalToolCard(toolName, props.terminalToolDisplayMode, isTerminalTool)
+    const showInline = shouldShowInlineToolCardBody(toolName, presentation.minimal, props.terminalToolDisplayMode, isTerminalTool)
+    const CompactToolView = showInline ? getToolViewComponent(toolName, props.block.tool) : null
     const compactViewOwnsInteractions = toolName === 'CodexDiff'
-    const ResultToolView = getToolResultViewComponent(toolName)
+    const ResultToolView = getToolResultViewComponent(toolName, props.block)
     const permission = props.block.tool.permission
     const isAskUserQuestion = isAskUserQuestionToolName(toolName)
     const isRequestUserInput = isRequestUserInputToolName(toolName)

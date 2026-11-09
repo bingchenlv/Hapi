@@ -1,16 +1,10 @@
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { sharedLaunchConfig } from './launch';
+import { sharedLaunchConfig, takeReservedSessionId } from './launch';
 import { parseCodexCliOverrides } from '../utils/codexCliOverrides';
 import { resolveCodexPermissionModeConfig } from '../utils/permissionModeConfig';
 
 describe('shared launch configuration', () => {
-    it('enables native waiting questions without changing plugins or the async compatibility switch', () => {
-        const result = sharedLaunchConfig({}, '/tmp');
-        expect(result.serverArgs).toContain('features.default_mode_request_user_input=true');
-        expect(result.threadParams.config).toMatchObject({ 'features.default_mode_request_user_input': true });
-        expect(result.threadParams.config).not.toHaveProperty('features.send_message_to_user_async');
-        expect(result.threadParams.developerInstructions).toContain('<hapi_user_input>');
-    });
     it.each(['default', 'read-only', 'yolo'] as const)('keeps explicit %s authoritative over native permission flags', permissionMode => {
         for (const flags of [
             ['--yolo'], ['--dangerously-bypass-approvals-and-sandbox'], ['--full-auto'],
@@ -20,33 +14,17 @@ describe('shared launch configuration', () => {
         ]) {
             const result = sharedLaunchConfig({ permissionMode, codexArgs: [...flags, '--no-alt-screen', '--', '--yolo'] }, '/tmp');
             const { approvalPolicy, sandbox } = resolveCodexPermissionModeConfig(permissionMode);
-            expect(result.threadParams).toMatchObject({ approvalPolicy, sandbox });
-            if (permissionMode !== 'default') {
-                expect(result.threadParams.approvalsReviewer).toBe('user');
-            } else if (flags.includes('--approve-for-me') || flags.includes('--not-so-yolo')) {
-                expect(result.threadParams.approvalsReviewer).toBe('auto_review');
-            } else {
-                expect(result.threadParams).not.toHaveProperty('approvalsReviewer');
-            }
+            expect(result.threadParams).toMatchObject({ approvalPolicy, sandbox, approvalsReviewer: 'user' });
             expect(parseCodexCliOverrides(result.tuiArgs)).toEqual({});
             expect(result.tuiArgs).toEqual(['--no-alt-screen', '--', '--yolo']);
             expect(result.tuiArgs.slice(-2)).toEqual(['--', '--yolo']);
             expect(result.tuiArgs).toContain('--no-alt-screen');
             expect(result.tuiArgs.slice(0, -2)).not.toContain('--yolo');
-            const expectedPermissionArgs = [
+            expect(result.serverArgs.slice(-6)).toEqual([
                 '-c', `approval_policy=${JSON.stringify(approvalPolicy)}`,
-                '-c', `sandbox_mode=${JSON.stringify(sandbox)}`,
-                ...(permissionMode !== 'default' ? ['-c', 'approvals_reviewer="user"'] : [])
-            ];
-            expect(result.serverArgs.slice(-expectedPermissionArgs.length)).toEqual(expectedPermissionArgs);
+                '-c', `sandbox_mode=${JSON.stringify(sandbox)}`, '-c', 'approvals_reviewer="user"'
+            ]);
         }
-    });
-    it('inherits the configured reviewer when reopening a default workspace session', () => {
-        const result = sharedLaunchConfig({ permissionMode: 'default', resumeSessionId: 'existing-thread' }, '/tmp');
-        expect(result.threadParams).toMatchObject({ approvalPolicy: 'on-request', sandbox: 'workspace-write' });
-        expect(result.threadParams).not.toHaveProperty('approvalsReviewer');
-        expect(result.threadParams.config).not.toHaveProperty('approvals_reviewer');
-        expect(result.serverArgs.join(' ')).not.toContain('approvals_reviewer');
     });
     it('keeps unspecified settings inherited and explicit Standard distinct', () => {
         expect(sharedLaunchConfig({}, '/tmp').threadParams).not.toHaveProperty('serviceTier');
@@ -56,8 +34,9 @@ describe('shared launch configuration', () => {
     });
     it('normalizes short flags, forwards configuration and resolves cwd exactly once', () => {
         const result = sharedLaunchConfig({ codexArgs: ['-C', 'project', '-mcustom', '-a', 'never', '--search', '--add-dir', '../extra', '-c', 'model_reasoning_effort="high"'] }, '/tmp');
-        expect(result.cwd).toBe('/tmp/project'); expect(result.tuiArgs).not.toContain('-C');
-        expect(result.threadParams).toMatchObject({ model: 'custom', approvalPolicy: 'never', config: { web_search: 'live', 'sandbox_workspace_write.writable_roots': ['/tmp/extra'] } });
+        const expectedCwd = resolve('/tmp', 'project');
+        expect(result.cwd).toBe(expectedCwd); expect(result.tuiArgs).not.toContain('-C');
+        expect(result.threadParams).toMatchObject({ model: 'custom', approvalPolicy: 'never', config: { web_search: 'live', 'sandbox_workspace_write.writable_roots': [resolve(expectedCwd, '../extra')] } });
         expect(result.serverArgs).toContain('model_reasoning_effort="high"');
     });
     it('rejects unsupported flags before starting an execution rather than silently ignoring them', () => {
@@ -68,10 +47,23 @@ describe('shared launch configuration', () => {
     it('does not interpret flags after -- as configuration', () => {
         expect(sharedLaunchConfig({ codexArgs: ['--', '--profile=explain'] }, '/tmp').tuiArgs).toEqual(['--', '--profile=explain']);
         expect(sharedLaunchConfig({ codexArgs: ['--', '-C', 'literal'] }, '/tmp').tuiArgs).toEqual(['--', '-C', 'literal']);
-        expect(() => sharedLaunchConfig({ permissionMode: 'safe-yolo' }, '/tmp')).toThrow('not a native shared');
+    });
+    it('maps HAPI autoReview to native auto-review in the workspace-write sandbox', () => {
+        const result = sharedLaunchConfig({ permissionMode: 'autoReview', codexArgs: ['--yolo'] }, '/tmp');
+        expect(result.threadParams).toMatchObject({ approvalPolicy: 'on-request', approvalsReviewer: 'auto_review', sandbox: 'workspace-write' });
+        expect(result.serverArgs).toEqual(['-c', 'approval_policy="on-request"', '-c', 'sandbox_mode="workspace-write"', '-c', 'approvals_reviewer="auto_review"']);
     });
     it('preserves launch-time provider and automatic-review policy', () => {
         const result = sharedLaunchConfig({ codexArgs: ['--oss', '--local-provider', 'ollama', '--approve-for-me'] }, '/tmp');
         expect(result.threadParams).toMatchObject({ modelProvider: 'ollama', approvalsReviewer: 'auto_review', sandbox: 'workspace-write' });
+    });
+});
+
+describe('takeReservedSessionId', () => {
+    it('returns the reservation once and clears it for subsequent prepare calls', () => {
+        const options = { reservedSessionId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' };
+        expect(takeReservedSessionId(options)).toBe('aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee');
+        expect(options.reservedSessionId).toBeUndefined();
+        expect(takeReservedSessionId(options)).toBeUndefined();
     });
 });

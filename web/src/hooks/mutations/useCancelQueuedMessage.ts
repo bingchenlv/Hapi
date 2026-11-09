@@ -9,7 +9,6 @@ import {
     removeOptimisticMessage,
 } from '@/lib/message-window-store'
 import { usePlatform } from '@/hooks/usePlatform'
-import { persistQueuedDismissal } from '@/lib/queued-dismissals'
 
 type CancelQueuedMessageInput = {
     sessionId: string
@@ -57,7 +56,6 @@ export function useCancelQueuedMessage(api: ApiClient | null) {
             // callers (Edit) decide to prefill. Returning synthetic `invoked` keeps
             // the existing Edit toast path and avoids a duplicate composer send.
             if (result.status === 'busy' && input.snapshot.deliveryState === 'indeterminate') {
-                persistQueuedDismissal(input.sessionId, input.snapshot)
                 // Restore a hidden hold BEFORE the queued-state lookup so a
                 // messages-consumed SSE during that await can still land.
                 appendOptimisticMessage(input.sessionId, {

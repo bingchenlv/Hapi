@@ -1,9 +1,13 @@
+import { CodexRoundDuration } from '../utils/roundDuration';
 import { createHash } from 'node:crypto';
 import type { ApiSessionClient } from '@/api/apiSession';
+import { normalizeSessionDisplayTitle } from '@/agent/sessionDisplayRename';
 import { registerGeneratedImageFromPath } from '@/modules/common/generatedImages';
 import { AppServerEventConverter } from '../utils/appServerEventConverter';
 import { record, string } from './gateway';
 import { codexPlanProposalId } from './plan';
+import { CodexCompactionSummaryLookup } from '../utils/codexCompactionSummary';
+import { asyncQuestionReplies, asyncQuestionsForItem } from './asyncQuestions';
 
 export function inputText(input: unknown): string {
     if (!Array.isArray(input)) return '';
@@ -16,7 +20,7 @@ export function inputText(input: unknown): string {
 
 function requestedTitle(item: Record<string, unknown>): string | undefined {
     if (item.type !== 'mcpToolCall' || item.server !== 'hapi' || item.tool !== 'change_title') return;
-    return string(record(item.arguments).title)?.trim() || undefined;
+    return normalizeSessionDisplayTitle(string(record(item.arguments).title)) ?? undefined;
 }
 
 function successfulTitle(item: Record<string, unknown>, pending?: string): string | undefined {
@@ -27,9 +31,14 @@ function successfulTitle(item: Record<string, unknown>, pending?: string): strin
     return requestedTitle(item) ?? pending;
 }
 
+function metadataHasDisplayTitle(metadata: { name?: string; summary?: { text: string } } | null | undefined): boolean {
+    return Boolean(metadata?.name?.trim() || metadata?.summary?.text?.trim());
+}
+
 /** Canonical V2 stream only. Stable message IDs also deduplicate snapshot replay at the hub. */
 export class SharedCodexProjection {
     private converter = new AppServerEventConverter();
+    private readonly roundDuration = new CodexRoundDuration();
     private readonly emitted = new Set<string>();
     private readonly turns = new Map<string, string>();
     private readonly turnModels = new Map<string, string>();
@@ -37,35 +46,41 @@ export class SharedCodexProjection {
     private readonly pendingTitles = new Map<string, string>();
     private readonly completedTitles = new Set<string>();
     private titleRevision = 0;
+    private readonly compactionSummaries: CodexCompactionSummaryLookup;
+    private summaryThread: unknown;
     constructor(private readonly session: ApiSessionClient, readonly threadId: string,
-        private readonly committed: (id: string) => Promise<void>, private readonly parentThreadId?: string) {
+        private readonly committed: (id: string) => Promise<void>, private readonly parentThreadId?: string,
+        private readonly readSummaryThread?: () => Promise<unknown>,
+        private readonly observeItem?: (threadId: string, item: unknown) => void) {
+        this.compactionSummaries = new CodexCompactionSummaryLookup(threadId);
         if (!parentThreadId) for (const [id, turn] of Object.entries(session.getMetadata()?.conversationHistoryTurns ?? {})) this.turns.set(id, turn);
     }
 
     turnFor(id: string): string | undefined { return this.turns.get(id); }
-    private originThread(turnId?: string): string {
-        return !this.parentThreadId && turnId
-            ? this.session.getMetadata()?.codexProviderHistory?.turnOrigins?.[turnId] ?? this.threadId
-            : this.threadId;
-    }
     reset(): void { this.converter = new AppServerEventConverter(); this.emitted.clear(); }
-    private send(body: Record<string, unknown>, key: string, turnId = key.split(':')[0]): void {
+    private send(body: Record<string, unknown>, key: string): void {
         if (this.emitted.has(key)) return;
         this.emitted.add(key);
-        // Forks replay notifications as well as snapshots. Native execution
-        // changes, but an inherited event keeps its original durable Hub ID.
-        const id = `codex:${this.originThread(turnId)}:${key}`;
+        const id = `codex:${this.threadId}:${key}`;
         this.session.sendAgentMessage(this.parentThreadId && !String(body.type).startsWith('agent-run-') ? {
             type: 'agent-run-trace', agentId: this.threadId, cardId: `codex-agent:${this.threadId}`, message: { ...body, id }, id,
             scope: { role: 'child', threadId: this.threadId, parentThreadId: this.parentThreadId }, scope_role: 'child'
         } : { ...body, id }, id);
     }
 
-    async notification(method: string, params: unknown, modelAtReceipt?: string): Promise<void> {
+    private applyDisplayRename(title: string, revision: number): void {
+        this.session.updateMetadata(metadata => {
+            if (revision !== this.titleRevision || metadata.titleLocked) return metadata;
+            const normalized = normalizeSessionDisplayTitle(title);
+            if (!normalized || metadata.name?.trim() === normalized) return metadata;
+            return { ...metadata, name: normalized };
+        });
+    }
+
+    async notification(method: string, params: unknown, modelAtReceipt?: string, receivedAt = Date.now()): Promise<void> {
         const p = record(params);
         const item = record(p.item);
-        if (!this.parentThreadId && p.threadId === this.threadId && string(item.id)
-            && this.originThread(string(p.turnId)) === this.threadId) {
+        if (!this.parentThreadId && p.threadId === this.threadId && string(item.id)) {
             const key = `${string(p.turnId) ?? 'thread'}:${item.id}`;
             if (!this.completedTitles.has(key)) {
                 const title = requestedTitle(item);
@@ -76,21 +91,42 @@ export class SharedCodexProjection {
                     if (completedTitle) {
                         this.completedTitles.add(key);
                         const revision = ++this.titleRevision;
-                        this.session.updateMetadata(metadata => revision !== this.titleRevision ? metadata : {
-                            ...metadata, summary: { text: completedTitle, updatedAt: Date.now() }
-                        });
+                        this.applyDisplayRename(completedTitle, revision);
                     }
                 }
             }
         }
         await this.project(method, params, modelAtReceipt);
+        if (p.threadId === this.threadId && !this.parentThreadId) {
+            const turn = record(p.turn);
+            const turnId = string(turn.id);
+            if (method === 'turn/started') this.roundDuration.start(turnId, receivedAt);
+            if (method === 'turn/completed') {
+                const duration = this.roundDuration.finish(turnId, receivedAt, turn.status === 'completed');
+                if (duration) this.send(duration, `duration:${turnId}`);
+            }
+        }
     }
 
-    private async project(method: string, params: unknown, modelAtReceipt?: string): Promise<void> {
+    private async project(method: string, params: unknown, modelAtReceipt?: string, fromHistory = false): Promise<void> {
         if (method.startsWith('codex/event/')) return;
         const p = record(params);
         const item = record(p.item);
         const turnId = string(p.turnId) ?? string(record(p.turn).id);
+        const send = (body: Record<string, unknown>, key: string) => this.send({
+            ...body, ...(turnId ? { turn_id: turnId } : {})
+        }, key);
+        const asyncQuestions = asyncQuestionsForItem(this.threadId, item);
+        if (asyncQuestions.length) {
+            if (method === 'item/completed') {
+                for (const question of asyncQuestions) {
+                    send({ type: 'tool-call', name: 'request_user_input', callId: question.id, input: question.input }, question.id);
+                }
+                this.observeItem?.(this.threadId, item);
+            }
+            return;
+        }
+        if (method === 'item/completed') this.observeItem?.(this.threadId, item);
         // Settings may already describe the next turn by the time queued
         // notifications are projected. Never attribute usage to that model.
         if (turnId && method === 'turn/started' && modelAtReceipt && !this.turnModels.has(turnId)) {
@@ -101,20 +137,22 @@ export class SharedCodexProjection {
         }
         const itemId = string(item.id) ?? string(p.itemId);
         if (!this.parentThreadId && (method === 'item/started' || method === 'item/completed') && item.type === 'userMessage') {
-            const id = string(item.clientId ?? item.clientUserMessageId) ?? (itemId ? `codex:${this.originThread(turnId)}:user:${itemId}` : undefined);
+            const id = string(item.clientId ?? item.clientUserMessageId) ?? (itemId ? `codex:${this.threadId}:user:${itemId}` : undefined);
             if (id) {
                 const firstInTurn = turnId ? [...this.turns].find(([, value]) => value === turnId)?.[0] : undefined;
                 if (turnId) this.turns.set(id, turnId);
                 await this.committed(id);
                 const text = inputText(item.content);
-                if (text && !id.startsWith('hapi:minimax-fallback:')) this.session.sendUserMessage(text, undefined, id);
+                const replies = asyncQuestionReplies(text);
+                const displayText = replies.length ? replies.map(reply => [reply.question, reply.answer].filter(Boolean).join('\n')).join('\n\n') : text;
+                if (displayText) this.session.sendUserMessage(displayText, undefined, id);
                 this.session.updateMetadata(metadata => ({ ...metadata, conversationHistoryTurns: Object.fromEntries(this.turns),
                     ...(turnId && (!firstInTurn || firstInTurn === id) ? { conversationHistoryPoints: { ...metadata.conversationHistoryPoints, [id]: true } } : {})
                 }));
             }
         }
         if (this.parentThreadId && (method === 'turn/started' || method === 'turn/completed')) {
-            this.send({ type: 'agent-run-update', agentId: this.threadId, cardId: `codex-agent:${this.threadId}`,
+            send({ type: 'agent-run-update', agentId: this.threadId, cardId: `codex-agent:${this.threadId}`,
                 status: method === 'turn/started' ? 'running' : record(p.turn).status === 'completed' ? 'completed' : 'failed'
             }, `lifecycle:${turnId}:${method}`);
         }
@@ -122,68 +160,100 @@ export class SharedCodexProjection {
         for (const event of events) {
             const callId = string(event.call_id);
             const key = `${turnId ?? 'thread'}:${itemId ?? callId ?? createHash('sha256').update(JSON.stringify(event)).digest('hex')}:${event.type}`;
-            if (event.type === 'agent_message') this.send({ type: 'message', message: event.message }, key);
-            else if (event.type === 'agent_reasoning') this.send({ type: 'reasoning', message: event.text }, key);
+            if (event.type === 'agent_message') send({ type: 'message', message: event.message }, key);
+            else if (event.type === 'agent_reasoning') send({ type: 'reasoning', message: event.text }, key);
             else if (event.type === 'exec_command_begin' && callId) {
-                this.send({ type: 'tool-call', name: 'CodexBash', callId, input: event }, key);
+                send({ type: 'tool-call', name: 'CodexBash', callId, input: event }, key);
             } else if (event.type === 'exec_command_end' && callId) {
-                this.send({ type: 'tool-call-result', callId, output: { ...event, stdout: event.output } }, key);
+                const failed = ['failed', 'cancelled', 'canceled', 'declined', 'interrupted'].includes(String(event.status))
+                    || (typeof event.exit_code === 'number' && event.exit_code !== 0)
+                    || Boolean(event.error);
+                send({ type: 'tool-call-result', callId, output: { ...event, stdout: event.output }, is_error: failed }, key);
             } else if (event.type === 'patch_apply_begin' && callId) {
-                this.send({ type: 'tool-call', name: 'CodexPatch', callId, input: { changes: event.changes, auto_approved: event.auto_approved } }, key);
+                send({ type: 'tool-call', name: 'CodexPatch', callId, input: { changes: event.changes, auto_approved: event.auto_approved } }, key);
             } else if (event.type === 'patch_apply_end' && callId) {
-                this.send({ type: 'tool-call-result', callId, output: { stdout: event.stdout, stderr: event.stderr, success: event.success } }, key);
+                send({ type: 'tool-call-result', callId, output: { stdout: event.stdout, stderr: event.stderr, success: event.success } }, key);
             } else if (event.type === 'mcp_tool_call_begin' && callId) {
                 const invocation = record(event.invocation);
-                this.send({ type: 'tool-call', name: `mcp__${invocation.server}__${invocation.tool}`, callId, input: invocation.arguments ?? {} }, key);
+                send({ type: 'tool-call', name: `mcp__${invocation.server}__${invocation.tool}`, callId, input: invocation.arguments ?? {} }, key);
             } else if (event.type === 'mcp_tool_call_end' && callId) {
                 const result = record(event.result);
-                this.send({ type: 'tool-call-result', callId, output: result.Ok ?? result.Err ?? event.result, is_error: 'Err' in result }, key);
+                send({ type: 'tool-call-result', callId, output: result.Ok ?? result.Err ?? event.result, is_error: 'Err' in result }, key);
             } else if (event.type === 'codex_tool_call_begin' && callId) {
-                this.send({ type: 'tool-call', name: event.name, callId, input: event.input ?? event.arguments }, key);
+                send({ type: 'tool-call', name: event.name, callId, input: event.input ?? event.arguments }, key);
             } else if (event.type === 'codex_tool_call_end' && callId) {
-                this.send({ type: 'tool-call-result', callId, output: event.output, is_error: event.is_error }, key);
-            } else if (event.type === 'token_count' || event.type === 'context_compacted' || event.type.startsWith('thread_goal_')) {
+                send({ type: 'tool-call-result', callId, output: event.output, is_error: event.is_error }, key);
+            } else if (event.type === 'compaction_started') {
+                // History replay re-projects every completed item's start;
+                // a finished compaction must not announce a live status.
+                if (fromHistory) continue;
+                if (this.parentThreadId) {
+                    send({ type: 'compaction_started', statusText: '📦 Compaction started' }, key);
+                } else {
+                    // Status UI listens on session events; an agent message
+                    // would render as a normal assistant bubble instead.
+                    // Dedup is in-memory only (this.emitted set).
+                    if (this.emitted.has(key)) continue;
+                    this.emitted.add(key);
+                    this.session.sendSessionEvent({ type: 'message', message: '📦 Compaction started' });
+                }
+            } else if (event.type === 'context_compacted') {
+                if (!fromHistory && this.readSummaryThread) {
+                    try { this.summaryThread = await this.readSummaryThread(); } catch { this.summaryThread = undefined; }
+                }
+                const compact = turnId && itemId ? await this.compactionSummaries.find(this.summaryThread, turnId, itemId, fromHistory ? { attempts: 1 } : undefined) : null;
+                if (compact) {
+                    // A distinct durable ID can enrich a previously stored boundary.
+                    // Clients fold it back into that exact compaction's original position.
+                    send({ type: 'compact-summary', ...compact, summary: compact.summary ?? '', compactionId: `codex:${this.threadId}:${key}` }, `${key}:summary`);
+                } else {
+                    send({ ...event, flavor: 'codex', scope: { role: 'parent', threadId: this.threadId }, scope_role: 'parent', thread_id: this.threadId }, key);
+                }
+            } else if (event.type === 'token_count' || event.type.startsWith('thread_goal_')) {
                 const model = event.type === 'token_count' && turnId ? this.turnModels.get(turnId) : undefined;
-                this.send({ ...event, ...(model ? { model } : {}), flavor: 'codex', scope: { role: 'parent', threadId: this.threadId }, scope_role: 'parent', thread_id: this.threadId }, key);
+                send({ ...event, ...(model ? { model } : {}), flavor: 'codex', scope: { role: 'parent', threadId: this.threadId }, scope_role: 'parent', thread_id: this.threadId }, key);
             } else if (event.type === 'proposed_plan' && turnId && itemId) {
-                const planId = codexPlanProposalId(this.originThread(turnId), turnId, itemId);
-                this.send({ type: 'tool-call', name: 'ExitPlanMode', callId: planId, input: { plan: event.plan } }, key);
+                const planId = codexPlanProposalId(this.threadId, turnId, itemId);
+                send({ type: 'tool-call', name: 'ExitPlanMode', callId: planId, input: { plan: event.plan } }, key);
                 // A proposal is durable content, not a native approval request.
-                this.send({ type: 'tool-call-result', callId: planId, output: null }, `${key}:result`);
+                send({ type: 'tool-call-result', callId: planId, output: null }, `${key}:result`);
             } else if (event.type === 'plan_update') {
-                this.send({ type: 'tool-call', name: 'update_plan', callId: 'codex-plan-state', input: { plan: event.plan, source: 'codex' } }, key);
-                this.send({ type: 'tool-call-result', callId: 'codex-plan-state', output: { plan: event.plan, source: 'codex', status: 'updated' } }, `${key}:result`);
+                const callId = turnId ? `codex-plan-state:${turnId}` : 'codex-plan-state';
+                send({ type: 'tool-call', name: 'update_plan', callId, input: { plan: event.plan, source: 'codex' } }, key);
+                send({ type: 'tool-call-result', callId, output: { plan: event.plan, source: 'codex', status: 'updated' } }, `${key}:result`);
             } else if (event.type === 'generated_image' && typeof event.saved_path === 'string') {
-                const image = await registerGeneratedImageFromPath({ path: event.saved_path, id: createHash('sha256').update(`${this.originThread(turnId)}:${key}`).digest('hex'), fileName: string(event.file_name) });
-                if (image) this.send({ type: 'generated-image', imageId: image.id, fileName: image.fileName, mimeType: image.mimeType }, key);
+                const image = await registerGeneratedImageFromPath({ path: event.saved_path, id: createHash('sha256').update(`${this.threadId}:${key}`).digest('hex'), fileName: string(event.file_name) });
+                if (image) send({ type: 'generated-image', imageId: image.id, fileName: image.fileName, mimeType: image.mimeType }, key);
+            } else if (event.type === 'viewed_image' && typeof event.path === 'string') {
+                const image = await registerGeneratedImageFromPath({ path: event.path, id: createHash('sha256').update(`${this.threadId}:${key}`).digest('hex') });
+                if (image) send({
+                    type: 'generated-image', imageId: image.id, fileName: image.fileName, mimeType: image.mimeType,
+                    source: { ingress: 'tool_result', flavor: 'codex', toolName: 'view_image', ...(callId ? { toolCallId: callId } : {}) }
+                }, key);
             } else if (event.type === 'task_failed') {
-                this.send({ type: 'message', message: `Codex error: ${event.error ?? event.message ?? 'Turn failed'}` }, key);
+                send({ type: 'message', message: `Codex error: ${event.error ?? event.message ?? 'Turn failed'}` }, key);
             }
         }
         if (item.type === 'collabAgentToolCall') {
             const states = record(item.agentsStates);
             for (const [agentId, state] of Object.entries(states)) {
                 const status = string(record(state).status) ?? 'running';
-                this.send({ type: 'agent-run-update', agentId, cardId: `codex-agent:${agentId}`,
+                send({ type: 'agent-run-update', agentId, cardId: `codex-agent:${agentId}`,
                     status: status === 'completed' ? 'completed' : status === 'errored' ? 'failed' : 'running',
                     summary: record(state).message, input: item, scope: { role: 'child', threadId: agentId, parentThreadId: this.threadId }, scope_role: 'child', thread_id: agentId
-                }, `agent:${agentId}:${itemId}:${method}:${JSON.stringify(state)}`, turnId);
+                }, `agent:${agentId}:${itemId}:${method}:${JSON.stringify(state)}`);
             }
         }
     }
 
     async history(thread: unknown): Promise<void> {
+        if (record(thread).id === this.threadId) this.summaryThread = thread;
         const turns = record(thread).turns;
         if (!Array.isArray(turns)) return;
         const titleRevision = this.titleRevision;
         let latestTitle: string | undefined;
         for (const value of turns) {
             const turn = record(value);
-            // Provider migration forks native history into the same HAPI chat.
-            // These turns were flushed before the fork and already exist in
-            // the hub under their original stable IDs; never emit them twice.
-            if (!this.parentThreadId && typeof turn.id === 'string'
-                && this.session.getMetadata()?.codexProviderHistory?.inheritedTurnIds.includes(turn.id)) continue;
             if (!Array.isArray(turn.items)) continue;
             for (const item of turn.items) {
                 const params = { threadId: this.threadId, turnId: turn.id, item };
@@ -192,10 +262,11 @@ export class SharedCodexProjection {
                 if (!this.parentThreadId && string(record(item).id) && pendingTitle && !this.completedTitles.has(titleKey)) {
                     this.pendingTitles.set(titleKey, pendingTitle);
                 }
-                await this.project('item/started', params);
+                await this.project('item/started', params, undefined, true);
                 // Active snapshots can contain partial assistant text. Do not
                 // settle it under the final stable id and suppress completion.
-                if (turn.status !== 'inProgress' || record(item).status === 'completed' || record(item).type === 'userMessage') {
+                if (turn.status !== 'inProgress' || record(item).status === 'completed' || record(item).type === 'userMessage'
+                    || asyncQuestionsForItem(this.threadId, item).length > 0) {
                     if (!this.parentThreadId) {
                         const title = successfulTitle(record(item));
                         if (title && string(record(item).id)) {
@@ -204,17 +275,23 @@ export class SharedCodexProjection {
                         }
                         this.pendingTitles.delete(titleKey);
                     }
-                    await this.project('item/completed', params);
+                    await this.project('item/completed', params, undefined, true);
                 }
             }
         }
         // Repair sessions created while remote title projection was missing.
         // Recheck inside the metadata lock: live updates may still be queued,
-        // and a replay must never replace an existing or newer title.
-        if (latestTitle && titleRevision === this.titleRevision && !this.session.getMetadata()?.summary?.text?.trim()) {
+        // and a replay must never replace an existing or newer display title.
+        if (latestTitle && titleRevision === this.titleRevision && !metadataHasDisplayTitle(this.session.getMetadata())) {
             const title = latestTitle;
-            this.session.updateMetadata(metadata => titleRevision !== this.titleRevision || metadata.summary?.text?.trim()
-                ? metadata : { ...metadata, summary: { text: title, updatedAt: Date.now() } });
+            this.session.updateMetadata(metadata => {
+                if (titleRevision !== this.titleRevision || metadataHasDisplayTitle(metadata)) {
+                    return metadata;
+                }
+                const normalized = normalizeSessionDisplayTitle(title);
+                if (!normalized) return metadata;
+                return { ...metadata, name: normalized };
+            });
         }
     }
 }

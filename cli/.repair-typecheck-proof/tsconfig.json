@@ -1,1 +1,0 @@
-{"compilerOptions": {"strict": true, "skipLibCheck": true, "noEmit": true, "types": [], "allowJs": true, "checkJs": true, "declaration": true}, "files": ["first.ts", "unreferenced.ts", "jsdoc.js"]}

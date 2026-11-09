@@ -8,10 +8,7 @@ import { ApiError } from '@/api/client'
  * body is `{ error, code? }`. Both shapes are surfaced verbatim; we fall back
  * to the raw `Error.message` when the body is unparseable or absent.
  */
-export function formatReopenError(error: unknown, resourceBusyMessage?: string): string {
-    if (error instanceof ApiError && error.code === 'resource_busy' && resourceBusyMessage) {
-        return resourceBusyMessage + (error.requestId ? ` (${error.requestId})` : '')
-    }
+export function formatReopenError(error: unknown): string {
     const fallback = error instanceof Error ? error.message : 'Failed to reopen session'
 
     const body = error instanceof ApiError ? error.body : undefined

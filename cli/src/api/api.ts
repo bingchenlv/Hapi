@@ -1,4 +1,3 @@
-import type { SessionProject } from '@hapi/protocol'
 import axios from 'axios'
 import type { AgentState, ClearOpencodeSessionCallbackRequest, ClearOpencodeSessionResponse, CreateMachineResponse, CreateSessionResponse, RunnerState, Machine, MachineMetadata, Metadata, Session } from '@/api/types'
 import { applyHubSessionSummaryContract } from '@/modules/common/sessionSummaryInstruction'
@@ -39,6 +38,8 @@ export class ApiClient {
 
     async getOrCreateSession(opts: {
         id?: string
+        /** Bind a hub-preallocated stub (requires id). */
+        adopt?: boolean
         tag: string
         metadata: Metadata
         state: AgentState | null
@@ -57,6 +58,7 @@ export class ApiClient {
             `${configuration.apiUrl}/cli/sessions`,
             {
                 id: opts.id,
+                ...(opts.adopt === true ? { adopt: true } : {}),
                 tag: opts.tag,
                 metadata: opts.metadata,
                 agentState: opts.state,
@@ -126,11 +128,6 @@ export class ApiClient {
             permissionMode: raw.permissionMode,
             collaborationMode: raw.collaborationMode
         }
-    }
-
-    async setSessionProject(sessionId: string, project: SessionProject | null, expectedMetadataVersion: number): Promise<void> {
-        await axios.put(`${configuration.apiUrl}/cli/sessions/${encodeURIComponent(sessionId)}/project`,
-            { project, expectedMetadataVersion }, { headers: this.authHeaders(), timeout: 30_000 })
     }
 
     async getSession(sessionId: string): Promise<Session> {

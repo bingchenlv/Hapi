@@ -22,13 +22,6 @@ const models: CodexModelSummary[] = [
 ]
 
 describe('Codex model capabilities', () => {
-    it('uses the three real DeepSeek levels even for missing or stale machine catalogues', () => {
-        for (const model of ['deepseek-flash','deepseek-v4-pro']) {
-            expect(getCodexModelReasoningEfforts([], model)).toEqual(['low','high','max']);
-            expect(supportsCodexReasoningEffort([], model, 'medium')).toBe(false);
-            expect(supportsCodexReasoningEffort([], model, 'max')).toBe(true);
-        }
-    })
     it('resolves auto and missing model ids to the reported default model', () => {
         expect(resolveCodexModel(models, 'auto')?.id).toBe('gpt-5.6-sol')
         expect(resolveCodexModel(models, null)?.id).toBe('gpt-5.6-sol')

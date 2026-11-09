@@ -34,15 +34,14 @@ function formatCodexReasoningEffortLabel(effort: string): string {
 
 function buildDynamicReasoningEffortOptions(
     currentEffort: string | null,
-    dynamicOptions: ComposerReasoningEffortSourceOption[],
-    restrictToSupported = false
+    dynamicOptions: ComposerReasoningEffortSourceOption[]
 ): CodexComposerReasoningEffortOption[] {
     const optionValues = new Set(dynamicOptions.map((option) => option.value))
     const options: CodexComposerReasoningEffortOption[] = [
         { value: null, label: 'Default' }
     ]
 
-    if (!restrictToSupported && currentEffort && !optionValues.has(currentEffort)) {
+    if (currentEffort && !optionValues.has(currentEffort)) {
         options.push({
             value: currentEffort,
             label: formatCodexReasoningEffortLabel(currentEffort)
@@ -60,8 +59,7 @@ function buildDynamicReasoningEffortOptions(
 export function getCodexComposerReasoningEffortOptions(
     currentEffort?: string | null,
     flavor?: string | null,
-    dynamicOptions?: ComposerReasoningEffortSourceOption[] | null,
-    restrictToSupported = false
+    dynamicOptions?: ComposerReasoningEffortSourceOption[] | null
 ): CodexComposerReasoningEffortOption[] {
     const normalizedCurrentEffort = normalizeCodexComposerReasoningEffort(currentEffort)
 
@@ -69,15 +67,11 @@ export function getCodexComposerReasoningEffortOptions(
         if (!dynamicOptions || dynamicOptions.length === 0) {
             return []
         }
-        return buildDynamicReasoningEffortOptions(normalizedCurrentEffort, dynamicOptions, restrictToSupported)
+        return buildDynamicReasoningEffortOptions(normalizedCurrentEffort, dynamicOptions)
     }
 
     if (dynamicOptions && dynamicOptions.length > 0) {
-        return buildDynamicReasoningEffortOptions(normalizedCurrentEffort, dynamicOptions, restrictToSupported)
-    }
-    if (restrictToSupported) {
-        // Until this model's catalogue arrives, only its explicit default is safe.
-        return [{ value: null, label: 'Default' }]
+        return buildDynamicReasoningEffortOptions(normalizedCurrentEffort, dynamicOptions)
     }
 
     const options: CodexComposerReasoningEffortOption[] = [

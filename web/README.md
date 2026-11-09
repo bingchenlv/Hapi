@@ -2,17 +2,6 @@
 
 React Mini App / PWA for monitoring and controlling hapi sessions.
 
-## Bounded production build (local extension, 2026-10-23)
-
-The build prebundles the installed runtime dependencies into local, content-hashed
-ESM assets before Vite processes the application. Entries share chunks (including
-one React instance); no CDN, dependency upgrade or removed diagram/highlighting
-capability. `.local-vendor/manifest.json` records exact installed-input hashes.
-Run `bun run build` through the shared host's `server-hardening/runtime/heavy_task.py`
-entry when on this server. Raw child builds inherit the chat's OOM domain.
-Temporary prebundles are generated files, not an alternate source tree. Changes
-to dependency imports or the lockfile require a fresh prebundle before Vite.
-
 ## What it does
 
 - Session list with status, pending approvals, todos, and summaries.
@@ -34,7 +23,7 @@ to dependency imports or the lockfile require a fresh prebundle before Vite.
 - When opened in a normal browser, you can log in with `CLI_API_TOKEN:<namespace>` (or `CLI_API_TOKEN` for the default namespace).
 - The login screen includes a top-right hub picker; if unset, the app uses the same origin it was loaded from.
 - Live updates come from the hub via SSE.
-- Session `@` suggestions require conversation content, including untitled conversations. Names and directory labels affect display/search, not eligibility; empty stubs stay excluded.
+- Session `@` suggestions require conversation content, including untitled conversations. Names and directory labels affect display/search, not eligibility; empty stubs stay excluded. See the [session list behavior guide](../docs/guide/session-list.md) for search and picker rules.
 
 ## Routes
 
@@ -52,7 +41,7 @@ See `src/router.tsx` for route definitions.
 - `/settings` - Settings category hub (mobile) and responsive master-detail shell.
 - `/settings/general` - Language preferences.
 - `/settings/display` - Appearance, typography, colors, and session list preferences.
-- `/settings/chat` - Message input, tool card, and conversation color preferences.
+- `/settings/chat` - Message input, concise view, tool card, and conversation color preferences.
 - `/settings/voice` - Everyday voice assistant preferences.
 - `/settings/voice/voices` - Full-page voice picker.
 - `/settings/voice/advanced` - Voice persona, tuning, and diagnostics.
@@ -70,12 +59,28 @@ See `src/router.tsx` for route definitions.
 - Todo progress display.
 - Pending permission request count.
 - Agent name and model display.
+- Metadata search with relevance ranking, wildcard matching, and date/unread/machine filters.
+- Stable user-input ordering across sessions and machine/project groups; agent output and status updates do not reorder ordinary rows.
+- Machine/project grouping, pinned and in-progress sections, and configurable collapsed previews.
+
+### Session title lock
+
+The rename dialog has a per-session lock beside the title input. New and existing
+sessions are unlocked by default. Saving a manual name does not automatically lock
+it: agents may still rename an unlocked session. Locking prevents agent title
+updates; users can still edit or generate a title and save it while locked.
+Save applies the title and lock together; Cancel discards both changes. Unlocking
+allows future agent title updates without immediately changing the current title.
+The Hub persists and enforces the lock across clients, restarts, and resume.
 
 ### Chat interface (`src/components/SessionChat.tsx`)
 
 - Message thread with infinite scroll.
+- Concise view (header toggle or `/settings/chat`, per device): shows only user input and each round's final reply (`src/chat/conciseView.ts`). Permission requests, questions, plan proposals, user shell commands, and errors stay visible; the full thread returns while a search target is active.
 - Composer for sending messages.
+- A collapsible **Awaiting your reply** section above the composer collects all live non-blocking `request_user_input` questions, including those outside the loaded transcript. Answer there or dismiss individual questions without sending an answer or stopping the agent. Collapsing preserves drafts; blocking permissions retain their existing controls.
 - Permission mode and model selection for supported agents.
+  Cursor Auto uses CLI Auto for new/resumed sessions configured with Auto. Switching a live session to Auto when ACP does not advertise a literal Auto option relaunches the Cursor ACP process in place under `--model auto` while preserving the hub session id.
 - Session abort and handoff controls.
 - Codex **Continue planning** hides the current proposal's action menu locally
   and focuses the composer without sending a message or replacing its draft.
@@ -117,7 +122,7 @@ See `src/router.tsx` for route definitions.
 Modular session creation:
 
 - Machine selector
-- Directory input with recent paths
+- Directory input with recent paths. The path tail is revealed after loading or selecting a path and after leaving the editor. Unfocused inputs support horizontal touch scrolling; focused inputs retain native editing and text selection.
 - Agent type selector
 - Model selector
 - Per-agent permission, effort, and collaboration controls when supported

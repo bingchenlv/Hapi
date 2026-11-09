@@ -1,5 +1,4 @@
 import type { CodexModelSummary } from '@/types/api'
-import { DEEPSEEK_EFFORTS, isDeepSeekModel } from '@hapi/protocol'
 
 type ModelSelection = string | { modelId: string } | null | undefined
 
@@ -30,7 +29,6 @@ export function getCodexModelReasoningEfforts(
     models: readonly CodexModelSummary[],
     model: ModelSelection
 ): string[] | undefined {
-    if (isDeepSeekModel(typeof model === 'string' ? model : model?.modelId)) return [...DEEPSEEK_EFFORTS]
     return normalizeEfforts(resolveCodexModel(models, model)?.supportedReasoningEfforts)
 }
 

@@ -17,6 +17,8 @@ export type SpawnRpcOutcome =
         message: string
         code?: SpawnRpcErrorCode
         agent?: AgentFlavor
+        /** Explicit false = no OS child; stub safe to delete (#1911 B3). */
+        childStarted?: boolean
     }
 
 /**
@@ -44,15 +46,21 @@ export function mapSpawnRpcResult(result: unknown): SpawnRpcOutcome {
         if (obj.type === 'error' && typeof obj.errorMessage === 'string') {
             const code = normalizeSpawnErrorCode(obj.code)
             const unavailableAgent = typeof obj.agent === 'string' ? obj.agent as AgentFlavor : undefined
+            const childStarted = obj.childStarted === false ? false : undefined
             return {
                 type: 'error',
                 message: obj.errorMessage,
                 ...(code ? { code } : {}),
                 ...(unavailableAgent ? { agent: unavailableAgent } : {}),
+                ...(childStarted === false ? { childStarted: false } : {}),
             }
         }
         if (obj.type === 'requestToApproveDirectoryCreation' && typeof obj.directory === 'string') {
-            return { type: 'error', message: `Directory creation requires approval: ${obj.directory}` }
+            return {
+                type: 'error',
+                message: `Directory creation requires approval: ${obj.directory}`,
+                childStarted: false,
+            }
         }
         if (typeof obj.error === 'string') {
             return { type: 'error', message: obj.error }

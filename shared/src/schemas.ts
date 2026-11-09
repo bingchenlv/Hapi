@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { SessionProjectSchema } from './sessionProject'
+import { SessionReadStateSchema } from './sessionReadState'
 import { COPILOT_AGENT_MODES, type CopilotAgentMode } from './copilotModes'
 import { CODEX_COLLABORATION_MODES, PERMISSION_MODES } from './modes'
 import { AgentConfigDescriptorSchema } from './agentConfig'
@@ -85,8 +86,21 @@ export const MetadataSchema = z.object({
     // Kept separately from `name` so a later manual rename never reuses a number.
     codexAutoNameSequence: z.number().int().positive().optional(),
     codexAutoNameTitle: z.string().optional(),
+    titleLocked: z.boolean().optional(),
     os: z.string().optional(),
+    // Set when the title was chosen via the hapi change_title MCP tool. ACP
+    // native session-title sync must not overwrite it, including after
+    // launcher recreation or session resume.
+    acpManualTitle: z.boolean().optional(),
     summary: MetadataSummarySchema.optional(),
+    // Hub-owned marker: the automatic first-turn title fallback has been
+    // attempted for this session. It prevents silent retries after failures.
+    titleSuggestionAutoAttemptedAt: z.number().int().positive().optional(),
+    // Hub-owned lifecycle snapshot used to recognize a first turn after restart.
+    titleSuggestionTurn: z.object({ first: z.boolean(), completed: z.boolean() }).optional(),
+    // Hub-owned provisional title from the first user prompt. Shown only until
+    // `name` or `summary` exists; it never blocks generated/native titles.
+    promptTitle: z.string().optional(),
     machineId: z.string().optional(),
     claudeSessionId: z.string().optional(),
     // Parent HAPI session id when this session was created by message-level fork
@@ -124,6 +138,8 @@ export const MetadataSchema = z.object({
     opencodeSessionId: z.string().optional(),
     grokSessionId: z.string().optional(),
     agySessionId: z.string().optional(),
+    /** Set while an agy session runs on `agy acp`; absent otherwise. */
+    agyProtocol: z.literal('acp').optional(),
     cursorSessionId: z.string().optional(),
     cursorSessionProtocol: z.enum(['acp', 'stream-json']).optional(),
     // Drives the web `CursorMigrationBanner`:
@@ -136,6 +152,9 @@ export const MetadataSchema = z.object({
     kimiSessionId: z.string().optional(),
     copilotSessionId: z.string().optional(),
     piSessionId: z.string().optional(),
+    // Native DeepSeek Harness ACP session id. Current DSH ACP profiles
+    // resume persisted sessions through the non-standard `session/resume`.
+    dshSessionId: z.string().optional(),
     piResumeAttempt: z.object({
         state: z.enum(['resuming', 'terminating', 'quarantined']),
         machineId: z.string(),
@@ -152,6 +171,14 @@ export const MetadataSchema = z.object({
         state: z.enum(['resuming', 'quarantined']),
         machineId: z.string(),
         startedAt: z.number(),
+        // Same durability as piResumeAttempt: clear-before-spawn +
+        // rollbackSafe:false quarantine must not lose archive fields (#1911).
+        archiveSnapshot: z.object({
+            lifecycleState: z.string().optional(),
+            lifecycleStateSince: z.number().optional(),
+            archivedBy: z.string().optional(),
+            archiveReason: z.string().optional(),
+        }).optional(),
     }).optional(),
     tools: z.array(z.string()).optional(),
     slashCommands: z.array(z.string()).optional(),
@@ -161,10 +188,21 @@ export const MetadataSchema = z.object({
     happyToolsDir: z.string().optional(),
     startedFromRunner: z.boolean().optional(),
     hostPid: z.number().optional(),
+    // Start marker of the reporting CLI process (cli getProcessStartMarker):
+    // lets the runner refuse to adopt a late webhook whose PID has since been
+    // reused by another process.
+    hostStartMarker: z.string().optional(),
     hapiMcpUrl: z.string().url().optional(),
     startedBy: z.enum(['runner', 'terminal']).optional(),
+    // 'running' | 'idle' | 'archived' (see shared/src/sessionLifecycle.ts).
+    // 'idle' is written by the hub's keepalive-idle reconciler (tiann/hapi#1820)
+    // and reverts to 'running' on the next agent progress.
     lifecycleState: z.string().optional(),
     lifecycleStateSince: z.number().optional(),
+    // Opt out of keepalive-idle reconciliation for sessions that are meant to
+    // sit quiet indefinitely (operator holding pens, sessions owning work the
+    // hub cannot see). Never reconciled to 'idle' while true.
+    idleReconcileExempt: z.boolean().optional(),
     archivedBy: z.string().optional(),
     archiveReason: z.string().optional(),
     // Set only after a completed fresh-session clear. The source row remains
@@ -203,6 +241,14 @@ export const MetadataSchema = z.object({
     }).optional(),
     // Set when native rewind succeeded but HAPI truncate/hydrate failed.
     conversationHistoryDiverged: z.boolean().optional(),
+    // Durable cold-fork reservation: retries reuse the same native/Hub child.
+    codexArchivedFork: z.object({
+        operationId: z.string().uuid(), childSessionId: z.string().uuid(),
+        boundaryLocalId: z.string().optional(), boundaryTurnId: z.string().optional(),
+        nativeSessionId: z.string().optional(), spawnAttempted: z.boolean().optional()
+    }).optional(),
+    // A timed-out resume can still activate later; retain until native ready or proven stopped.
+    codexResumePending: z.object({ machineId: z.string(), nativeSessionId: z.string() }).optional(),
     worktree: WorktreeMetadataSchema.optional(),
     // Cached Pi model list — written by CLI, read by web (inactive session fallback).
     // Minimal shape: each entry must have modelId; other fields (provider, name, etc.) pass through.
@@ -254,6 +300,8 @@ export const AgentStateSchema = z.object({
     controlledByUser: z.boolean().nullish(),
     // Current actionable shared Codex proposal; content remains in the transcript.
     codexPlanProposalId: z.string().nullish(),
+    // Observed dequeue during live context compaction; not a consumption ACK.
+    codexCompactionPendingMessageIds: z.array(z.string()).nullish(),
     // True while the CLI is delivering a queued message into the active turn
     // (Steer). Surfaced so the web can reflect the inject in progress.
     steeringActive: z.boolean().nullish(),
@@ -353,6 +401,7 @@ export const AttachmentMetadataSchema = z.object({
 export type AttachmentMetadata = z.infer<typeof AttachmentMetadataSchema>
 
 export const DecryptedMessageSchema = z.object({
+    contentRevision: z.number().int().nonnegative().safe().optional(),
     id: z.string(),
     seq: z.number().nullable(),
     localId: z.string().nullable(),
@@ -363,13 +412,27 @@ export const DecryptedMessageSchema = z.object({
     // The agent was sent the steer but its final outcome could not be proven.
     // The row stays uninvoked and requires an explicit user resolution.
     deliveryState: z.literal('indeterminate').optional(),
+    // A live dispatch is still unconfirmed, but is not an invitation to resend.
+    deliveryPending: z.literal(true).optional(),
     // Live signal via messages-consumed (steered:true); not persisted by the hub.
     steered: z.boolean().optional()
 })
 
 export type DecryptedMessage = z.infer<typeof DecryptedMessageSchema>
 
+// One entry of Claude's `system/background_tasks_changed` snapshot.
+export const BackgroundTaskSchema = z.object({
+    id: z.string(),
+    type: z.string(),
+    description: z.string()
+})
+
+export type BackgroundTask = z.infer<typeof BackgroundTaskSchema>
+
 export const SessionSchema = z.object({
+    contentRevision: z.number().int().nonnegative().safe().optional(),
+    readState: SessionReadStateSchema.optional(),
+    lastUserMessageAt: z.number().optional(),
     hasConversationContent: z.boolean().optional(),
     id: z.string(),
     namespace: z.string(),
@@ -389,6 +452,7 @@ export const SessionSchema = z.object({
     thinkingAt: z.number(),
     activeTurnStartedAt: z.number().nullable().optional(),
     backgroundTaskCount: z.number().optional(),
+    backgroundTasks: z.array(BackgroundTaskSchema).optional(),
     todos: TodosSchema.optional(),
     teamState: TeamStateSchema.optional(),
     // Watermarks for structured SSE patches (PR #897). Dual EventSource
@@ -438,6 +502,9 @@ const VersionedTeamStatePatchSchema = z.object({
 })
 
 export const SessionPatchSchema = z.object({
+    contentRevision: z.number().int().nonnegative().safe().optional(),
+    readState: SessionReadStateSchema.optional(),
+    lastUserMessageAt: z.number().optional(),
     active: z.boolean().optional(),
     thinking: z.boolean().optional(),
     activeTurnStartedAt: z.number().nullable().optional(),
@@ -463,6 +530,7 @@ export const SessionPatchSchema = z.object({
     collaborationMode: CodexCollaborationModeSchema.optional(),
     copilotAgentMode: CopilotAgentModeSchema.optional(),
     backgroundTaskCount: z.number().optional(),
+    backgroundTasks: z.array(BackgroundTaskSchema).optional(),
     // tiann/hapi#893 (scratchlist v2). Bumped whenever any entry on the
     // session_scratchlist table mutates. Web client uses the change as a
     // trigger to refetch the entries query - the timestamp itself is the
@@ -661,7 +729,9 @@ export const SyncEventSchema = z.discriminatedUnion('type', [
     }),
     SessionChangedSchema.extend({
         type: z.literal('messages-indeterminate'),
-        localIds: z.array(z.string())
+        localIds: z.array(z.string()),
+        // Older clients conservatively retain the unresolved row.
+        dispatching: z.literal(true).optional()
     }),
     SessionChangedSchema.extend({
         type: z.literal('messages-requeued'),

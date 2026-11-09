@@ -1,24 +1,36 @@
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { z } from 'zod';
-import { SessionProjectSchema } from '@hapi/protocol';
 import { resolveCodexCommand, type CodexCommand } from '../utils/codexExecutable';
 import { parseCodexCliOverrides, stripCodexCliOverrides } from '../utils/codexCliOverrides';
 import { resolveCodexPermissionModeConfig } from '../utils/permissionModeConfig';
-import { SHARED_USER_INPUT_CONFIG, withSharedUserInputPolicy } from './userInputPolicy';
+import { resolveModelCatalogArgs } from '../utils/modelCatalog';
+import { getCodexSystemPrompt } from '../utils/systemPrompt';
 import type { CodexAppServerClient } from '../codexAppServerClient';
 
 export const SharedLaunchSchema = z.object({
-    sessionProject: SessionProjectSchema.optional(),
     startedBy: z.enum(['runner', 'terminal']).optional(),
     codexArgs: z.array(z.string()).optional(),
-    permissionMode: z.enum(['default', 'read-only', 'safe-yolo', 'yolo']).optional(),
-    resumeSessionId: z.string().optional(), resumeLast: z.boolean().optional(), resumeAll: z.boolean().optional(), existingSessionId: z.string().optional(),
+    permissionMode: z.enum(['default', 'read-only', 'autoReview', 'yolo']).optional(),
+    resumeSessionId: z.string().optional(), resumeLast: z.boolean().optional(), resumeAll: z.boolean().optional(),
+    existingSessionId: z.string().optional(),
+    /** Hub-preallocated stub — create/adopt, not reopen. */
+    reservedSessionId: z.string().optional(),
     model: z.string().optional(), modelReasoningEffort: z.string().optional(),
     serviceTier: z.string().optional(), collaborationMode: z.enum(['default', 'plan']).optional(),
     workingDirectory: z.string().optional()
 });
 export type SharedLaunchOptions = z.infer<typeof SharedLaunchSchema>;
+
+/**
+ * Take the machine-spawn reservation for one create-path prepare().
+ * Clears it so a second root/fork cannot re-adopt (#1911 Opus Major).
+ */
+export function takeReservedSessionId(options: SharedLaunchOptions): string | undefined {
+    const id = options.reservedSessionId;
+    options.reservedSessionId = undefined;
+    return id;
+}
 
 /** Resolve once: a desktop server and a different PATH TUI are never mixed. */
 export function resolveSharedCodex(): CodexCommand {
@@ -35,11 +47,10 @@ export function resolveSharedCodex(): CodexCommand {
 export function sharedLaunchConfig(options: SharedLaunchOptions, cwd: string): {
     cwd: string; serverArgs: string[]; tuiArgs: string[]; threadParams: Record<string, unknown>;
 } {
-    if (options.permissionMode === 'safe-yolo') throw new Error('safe-yolo is not a native shared permission mode. Choose default, read-only, yolo, or native --approve-for-me.');
     const args = options.codexArgs ?? [];
     const serverArgs: string[] = [];
     let tuiArgs: string[] = [];
-    const config: Record<string, unknown> = { ...SHARED_USER_INPUT_CONFIG };
+    const config: Record<string, unknown> = {};
     const extraDirs: string[] = [];
     let model = options.model;
     let provider: string | undefined;
@@ -112,16 +123,13 @@ export function sharedLaunchConfig(options: SharedLaunchOptions, cwd: string): {
     if (extraDirs.length) config['sandbox_workspace_write.writable_roots'] = extraDirs.map(path => resolve(directory, path));
     if (provider) config.model_provider = provider;
     const permission = options.permissionMode ? resolveCodexPermissionModeConfig(options.permissionMode) : undefined;
-    // The hub also sends "default" when resuming a workspace-write session.
-    // That sandbox preset does not express who should review approvals; keep
-    // the user's configured reviewer (including auto_review) in that case.
-    const forceUserReviewer = permission && options.permissionMode !== 'default';
+    const reviewer = options.permissionMode === 'autoReview' ? 'auto_review' : 'user';
     if (permission) {
         // Explicit HAPI permission selection wins on every launch surface:
         // initial thread, attached TUI, and later native /new threads.
         config.approval_policy = permission.approvalPolicy;
         config.sandbox_mode = permission.sandbox;
-        if (forceUserReviewer) config.approvals_reviewer = 'user';
+        config.approvals_reviewer = reviewer;
     }
     // The attached TUI resumes a remote task, which rejects permission flags.
     // The initial thread already has their resolved policy; inherit it there.
@@ -129,6 +137,7 @@ export function sharedLaunchConfig(options: SharedLaunchOptions, cwd: string): {
     // Launch-wide flags also apply to later native /new roots, not just the
     // initial HAPI-created root. Explicit config layers keep their order.
     for (const [key, value] of Object.entries(config)) serverArgs.push('-c', `${key}=${JSON.stringify(value)}`);
+    serverArgs.push(...resolveModelCatalogArgs(serverArgs));
     return {
         cwd: directory, serverArgs, tuiArgs,
         threadParams: {
@@ -138,10 +147,9 @@ export function sharedLaunchConfig(options: SharedLaunchOptions, cwd: string): {
             ...(overrides.approvalPolicy ? { approvalPolicy: overrides.approvalPolicy } : {}),
             ...(overrides.sandbox ? { sandbox: overrides.sandbox } : {}),
             ...(autoReview ? { approvalPolicy: 'on-request', approvalsReviewer: 'auto_review', sandbox: 'workspace-write' } : {}),
-            ...(permission ? { approvalPolicy: permission.approvalPolicy, sandbox: permission.sandbox } : {}),
-            ...(forceUserReviewer ? { approvalsReviewer: 'user' } : {}),
+            ...(permission ? { approvalPolicy: permission.approvalPolicy, approvalsReviewer: reviewer, sandbox: permission.sandbox } : {}),
             config: { ...config, ...(options.modelReasoningEffort ? { model_reasoning_effort: options.modelReasoningEffort } : {}) },
-            developerInstructions: withSharedUserInputPolicy()
+            developerInstructions: getCodexSystemPrompt()
         }
     };
 }

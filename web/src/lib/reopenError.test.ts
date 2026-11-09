@@ -3,11 +3,6 @@ import { ApiError } from '@/api/client'
 import { formatReopenError } from './reopenError'
 
 describe('formatReopenError', () => {
-    it('uses translated resource-busy guidance and its correlation id', () => {
-        const error = new ApiError('raw internal detail', 503, 'resource_busy')
-        error.requestId = 'local-test-id'
-        expect(formatReopenError(error, '资源暂时繁忙')).toBe('资源暂时繁忙 (local-test-id)')
-    })
     it('renders error + missing fields from a 422 ApiError body', () => {
         const error = new ApiError(
             'HTTP 422 Unprocessable Entity: {"error":"Cursor session id is missing","missing":["cursorSessionId"]}',

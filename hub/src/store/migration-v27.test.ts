@@ -22,7 +22,7 @@ describe('schema migration v26 to v27', () => {
             old.close()
             store = new Store(path)
             const db = (store as unknown as { db: Database }).db
-            expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 27 })
+            expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 31 })
             expect(store.messages.getAllMessages(session.id)).toEqual([message])
             const input = { version: 1 as const, requestKey: randomUUID(), text: 'authorized maintenance' }
             const request = { ...input, contentSha256: createHash('sha256').update(maintenanceMessageDigestInput(session.id, input)).digest('hex') }
