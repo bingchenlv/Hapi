@@ -81,6 +81,23 @@ function decryptedMessage(id: string, content: unknown, createdAt: number): Decr
 }
 
 describe('reduceChatBlocks', () => {
+    it('excludes current and retired root agent cards but retains genuine trace-only children', () => {
+        const messages: NormalizedMessage[] = ['current-root', 'old-root', 'real-child'].map((agentId, i) => ({
+            id: `trace-${i}`, localId: null, createdAt: i + 1, role: 'event', isSidechain: false,
+            content: { type: 'agent-run-trace', agentId, cardId: `codex-agent:${agentId}`,
+                message: { type: 'message', message: `Output ${agentId}` } }
+        }));
+        const original = structuredClone(messages)
+        const unfiltered = reduceChatBlocks(messages, null)
+        expect(unfiltered.blocks.filter(block => block.kind === 'tool-call')).toHaveLength(3)
+        const filtered = reduceChatBlocks(messages, null, { rootThreadIds: ['current-root', 'old-root'] })
+        const agents = filtered.blocks.filter(block => block.kind === 'tool-call')
+        expect(agents).toHaveLength(1)
+        expect(agents[0].kind === 'tool-call' && agents[0].tool.input).toMatchObject({ agentId: 'real-child' })
+        expect(messages).toEqual(original)
+        expect(reduceChatBlocks(messages.slice(0, 2), null, { rootThreadIds: ['current-root', 'old-root'] }).blocks).toEqual([])
+    })
+
     it('renders Codex proposed plan tool messages as a completed plan card', () => {
         const plan = '# Plan\n\n1. Inspect\n2. Implement'
         const messages = [

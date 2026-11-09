@@ -420,7 +420,8 @@ export class AgyHeadlessDriver extends RemoteLauncherBase {
         // response if this turn is aborted or crashes mid-stream.
         const planner = new AgyPlannerAccumulator();
 
-        const child = this.spawnAgy(args, this.session.path);
+        const turnCwd = this.session.client.getMetadata()?.project?.directory ?? this.session.client.getMetadata()?.path ?? this.session.path;
+        const child = this.spawnAgy(args, turnCwd);
         this.child = child;
         child.stdout.setEncoding('utf8');
         child.stderr.setEncoding('utf8');

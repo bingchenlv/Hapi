@@ -7,7 +7,7 @@
  * - No E2E encryption; data is stored as JSON in SQLite
  */
 
-import { isKnownFlavor, isSteeringSupportedForSession, type LocalResumeTarget, type ResumableSession, type SessionEndReason } from '@hapi/protocol'
+import { inheritSessionProject, type SessionProject, isKnownFlavor, isSteeringSupportedForSession, type LocalResumeTarget, type ResumableSession, type SessionEndReason } from '@hapi/protocol'
 import {
     cliBinaryUpdatedOnDisk,
     isMachineCapabilitySkewed,
@@ -98,11 +98,11 @@ export type {
 
 export type ResumeSessionResult =
     | { type: 'success'; sessionId: string }
-    | { type: 'error'; message: string; code: 'session_not_found' | 'access_denied' | 'no_machine_online' | 'resume_unavailable' | 'resume_failed'; rollbackSafe?: boolean }
+    | { type: 'error'; message: string; code: 'session_not_found' | 'access_denied' | 'no_machine_online' | 'resume_unavailable' | 'resume_failed' | 'resource_busy'; rollbackSafe?: boolean }
 
 export type ReopenSessionResult =
     | { type: 'success'; sessionId: string; resumed: boolean; cursorSessionProtocol?: 'acp' | 'stream-json' }
-    | { type: 'error'; message: string; code: 'session_not_found' | 'access_denied' | 'no_machine_online' | 'resume_unavailable' | 'resume_failed' | 'metadata_conflict' }
+    | { type: 'error'; message: string; code: 'session_not_found' | 'access_denied' | 'no_machine_online' | 'resume_unavailable' | 'resume_failed' | 'metadata_conflict' | 'resource_busy' }
     | { type: 'incomplete'; message: string; missing: [string, ...string[]] }
 
 export type LocalResumeTargetResult =
@@ -198,6 +198,8 @@ export class SyncEngine {
     private readonly scratchlistUploadTails = new Map<string, Promise<unknown>>()
     /** Coalesce duplicate clear requests so retries cannot spawn two fresh sessions. */
     private readonly opencodeClearTails = new Map<string, Promise<ClearOpencodeSessionResult>>()
+    /** Serialize shared Codex /new numbering per namespace. */
+    private readonly codexAutoNameTails = new Map<string, Promise<void>>()
     /** Serialize fork/rewind per session so concurrent native rollbacks cannot stack. */
     private readonly historyActionsInFlight = new Set<string>()
     /**
@@ -1008,6 +1010,20 @@ export class SyncEngine {
         return this.machineCache.getOrCreateMachine(id, metadata, runnerState, namespace)
     }
 
+    sendMaintenanceMessage(sessionId: string, request: import('@hapi/protocol/apiTypes').MaintenanceMessageRequest) {
+        const session = this.getSession(sessionId)
+        if (!session?.active || session.metadata?.flavor !== 'codex' || this.historyActionsInFlight.has(sessionId)) {
+            throw new Error('Maintenance session binding is unavailable')
+        }
+        const result = this.messageService.sendMaintenanceMessage(sessionId, request)
+        if (result.inserted) this.sessionCache.markMessageQueued(sessionId, Date.now(), Date.now())
+        return result
+    }
+
+    getMaintenanceMessageReceipt(sessionId: string, requestKey: string) {
+        return this.store.getMaintenanceMessageReceipt(sessionId, requestKey)
+    }
+
     async sendMessage(
         sessionId: string,
         payload: {
@@ -1059,6 +1075,9 @@ export class SyncEngine {
         sessionId: string,
         messageId: string
     ): Promise<SteerQueuedMessageResponse> {
+        if (this.store.getMaintenanceRequestKey(sessionId, messageId)) {
+            return { status: 'failed', error: 'Maintenance messages require controller reconciliation', localId: null }
+        }
         const session = this.getSession(sessionId)
         if (!session) {
             return { status: 'failed', error: 'Session not found', localId: null }
@@ -1896,6 +1915,84 @@ export class SyncEngine {
         return null
     }
 
+    private async withCodexAutoNameLock<T>(namespace: string, fn: () => Promise<T>): Promise<T> {
+        const previous = this.codexAutoNameTails.get(namespace) ?? Promise.resolve()
+        let release!: () => void
+        const gate = new Promise<void>((resolve) => {
+            release = resolve
+        })
+        const tail = previous.catch(() => undefined).then(() => gate)
+        this.codexAutoNameTails.set(namespace, tail)
+        await previous.catch(() => undefined)
+        try {
+            return await fn()
+        } finally {
+            release()
+            if (this.codexAutoNameTails.get(namespace) === tail) {
+                this.codexAutoNameTails.delete(namespace)
+            }
+        }
+    }
+
+    private nextCodexAutoName(namespace: string): { sequence: number; name: string } {
+        let highest = 0
+        for (const session of this.sessionCache.getSessionsByNamespace(namespace)) {
+            const storedSequence = session.metadata?.codexAutoNameSequence
+            if (Number.isInteger(storedSequence) && storedSequence! > highest) {
+                highest = storedSequence!
+            }
+            const match = /^Codex-(\d+)$/.exec(session.metadata?.name?.trim() ?? '')
+            if (!match) continue
+            const namedSequence = Number(match[1])
+            if (Number.isSafeInteger(namedSequence) && namedSequence > highest) {
+                highest = namedSequence
+            }
+        }
+        const sequence = highest + 1
+        return { sequence, name: `Codex-${String(sequence).padStart(2, '0')}` }
+    }
+
+    private async assignNextCodexAutoName(sessionId: string, namespace: string): Promise<void> {
+        await this.withCodexAutoNameLock(namespace, async () => {
+            const { sequence, name } = this.nextCodexAutoName(namespace)
+            await this.sessionCache.assignCodexAutoName(sessionId, sequence, name)
+        })
+    }
+
+    setSessionProject(sessionId: string, namespace: string, project: SessionProject | null, expectedVersion: number): void {
+        const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
+        if (!access.ok || !access.session.metadata) throw new Error('Session not found or access denied')
+        const session = access.session
+        if (session.metadata!.flavor !== 'codex' && session.metadata!.flavor !== 'agy') throw new Error('Projects currently require Codex sessions')
+        if (session.metadataVersion !== expectedVersion) throw new Error('Session was modified concurrently')
+        if (project) {
+            const controller = this.sessionCache.getSessionByNamespace(project.controllerSessionId, namespace)
+            if (!controller?.metadata || controller.metadata.machineId !== session.metadata!.machineId) {
+                throw new Error('Project controller must be in this namespace and on the same machine')
+            }
+            if (project.role === 'controller' && controller.id !== session.id) throw new Error('Controller role requires the controller session itself')
+            if (project.role !== 'controller' && (!controller.metadata.project || controller.metadata.project.id !== project.id
+                || controller.metadata.project.directory !== project.directory)) throw new Error('Project binding does not match its controller')
+        }
+        const metadata = { ...session.metadata! }
+        if (project) metadata.project = project
+        else delete metadata.project
+        const result = this.store.sessions.updateSessionMetadata(session.id, metadata, expectedVersion, namespace, { touchUpdatedAt: false })
+        if (result.result !== 'success') {
+            this.sessionCache.refreshSession(session.id)
+            throw new Error(result.result === 'version-mismatch' ? 'Session was modified concurrently' : 'Failed to save project binding')
+        }
+        this.sessionCache.refreshSession(session.id)
+    }
+
+    projectForSpawn(sourceId: string, namespace: string, machineId: string): SessionProject {
+        const source = this.sessionCache.getSessionByNamespace(sourceId, namespace)
+        if (!source?.metadata?.project || source.metadata.machineId !== machineId || (source.metadata.flavor !== 'codex' && source.metadata.flavor !== 'agy')) {
+            throw new Error('Project source is unavailable for this machine or namespace')
+        }
+        return inheritSessionProject(source.metadata.project, source.id)!
+    }
+
     async clearConversation(sessionId: string, namespace: string): Promise<{ sessionId: string }> {
         const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
         if (!access.ok || !access.session.active || !access.session.metadata?.capabilities?.concurrentClients) {
@@ -1904,6 +2001,19 @@ export class SyncEngine {
         const result = await this.rpcGateway.clearConversation(access.sessionId)
         const child = await this.validateSharedChild(access.session, result.sessionId)
         if (!child) throw new Error('Invalid shared-runtime clear binding')
+        if (access.session.metadata.flavor === 'codex') {
+            try {
+                await this.assignNextCodexAutoName(child.id, namespace)
+            } catch (error) {
+                // The new conversation already exists. Never report /new as failed
+                // and tempt the client to retry into a duplicate root just because
+                // its cosmetic HAPI label could not be assigned.
+                console.warn('[shared-codex] Failed to assign sequential /new name', {
+                    sessionId: child.id,
+                    error: error instanceof Error ? error.message : String(error)
+                })
+            }
+        }
         // No superseded-session redirect: only the initiating client navigates.
         return { sessionId: child.id }
     }
@@ -1941,6 +2051,22 @@ export class SyncEngine {
 
     async deleteSession(sessionId: string): Promise<void> {
         await this.sessionCache.deleteSession(sessionId)
+    }
+
+    async hybridModel(sessionId: string, mode?: 'openai' | 'hybrid'): Promise<{ mode: 'openai' | 'hybrid' }> {
+        const result = await this.rpcGateway.hybridModel(sessionId, mode) as { mode?: unknown; error?: string };
+        if (!result || (result.mode !== 'hybrid' && result.mode !== 'openai')) {
+            throw new Error(result?.error ?? 'Hybrid model setting was not confirmed');
+        }
+        return { mode: result.mode };
+    }
+
+    async deepseekCollaboration(sessionId: string, mode?: 'openai' | 'hybrid'): Promise<{ mode: 'openai' | 'hybrid' }> {
+        const result = await this.rpcGateway.deepseekCollaboration(sessionId, mode) as { mode?: unknown; error?: string };
+        if (!result || (result.mode !== 'hybrid' && result.mode !== 'openai') || mode !== undefined && result.mode !== mode) {
+            throw new Error(result?.error ?? 'DeepSeek collaboration setting was not confirmed');
+        }
+        return { mode: result.mode };
     }
 
     async applySessionConfig(
@@ -2014,9 +2140,10 @@ export class SyncEngine {
         existingSessionId?: string,
         collaborationMode?: CodexCollaborationMode,
         copilotAgentMode?: CopilotAgentMode,
-        startingMode?: 'remote' | 'pty'
+        startingMode?: 'remote' | 'pty',
+        sessionProject?: SessionProject
     ): ReturnType<RpcGateway['spawnSession']> {
-        return await this.rpcGateway.spawnSession(
+        const args: Parameters<RpcGateway['spawnSession']> = [
             machineId,
             directory,
             agent,
@@ -2033,7 +2160,12 @@ export class SyncEngine {
             collaborationMode,
             copilotAgentMode,
             startingMode
-        )
+        ]
+        if (sessionProject) {
+            args[16] = undefined // forkSession
+            args[17] = sessionProject
+        }
+        return await this.rpcGateway.spawnSession(...args)
     }
 
     /**
@@ -2857,7 +2989,7 @@ export class SyncEngine {
         }
     }
 
-    async resumeSession(sessionId: string, namespace: string, opts?: { permissionMode?: PermissionMode }): Promise<ResumeSessionResult> {
+    async resumeSession(sessionId: string, namespace: string, opts?: { permissionMode?: PermissionMode; requestId?: string }): Promise<ResumeSessionResult> {
         const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
         if (!access.ok) {
             return {
@@ -3054,10 +3186,18 @@ export class SyncEngine {
                 access.sessionId,
                 session.collaborationMode ?? undefined,
                 session.copilotAgentMode ?? undefined,
-                resumedStartingMode
+                resumedStartingMode,
+                undefined, // forkSession
+                undefined, // sessionProject
+                opts?.requestId
             )
 
             if (spawnResult.type !== 'success') {
+                // A resource-guard rejection (child exit code 75 plus a
+                // `[HAPI resource guard]` marker on stderr) is transient and
+                // has to reach the API as 503 instead of 500. Every other
+                // spawn failure keeps the generic `resume_failed` code.
+                const failureCode = spawnResult.code === 'resource_busy' ? 'resource_busy' : 'resume_failed';
                 if (requiresPiNativeReady) {
                     const stopped = await this.terminateInPlacePiResume(
                         targetMachine.id,
@@ -3069,12 +3209,12 @@ export class SyncEngine {
                         return {
                             type: 'error',
                             message: spawnResult.message,
-                            code: 'resume_failed',
+                            code: failureCode,
                             rollbackSafe: false,
                         }
                     }
                 }
-                return { type: 'error', message: spawnResult.message, code: 'resume_failed' }
+                return { type: 'error', message: spawnResult.message, code: failureCode }
             }
 
             if (requiresPiNativeReady && spawnResult.sessionId !== access.sessionId) {
@@ -3280,7 +3420,7 @@ export class SyncEngine {
      * Returns `incomplete` (HTTP 422 from the route layer) when the agent metadata
      * needed to resume is missing.
      */
-    async reopenSession(sessionId: string, namespace: string): Promise<ReopenSessionResult> {
+    async reopenSession(sessionId: string, namespace: string, opts?: { requestId?: string }): Promise<ReopenSessionResult> {
         const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
         if (!access.ok) {
             return {
@@ -3388,7 +3528,7 @@ export class SyncEngine {
                 }
             }
 
-            const resumeResult = await this.resumeSession(access.sessionId, namespace)
+            const resumeResult = await this.resumeSession(access.sessionId, namespace, opts)
             if (resumeResult.type === 'error') {
                 // Never restore archived metadata over a live Pi child. A live
                 // row blocks retry by itself and must remain visible as active.
@@ -3414,7 +3554,7 @@ export class SyncEngine {
         // Not active and not archived (e.g. brand-new session that has not yet connected,
         // or one that ended without writing archive metadata). Forward to resume so the
         // operator still gets one-click revival.
-        const resumeResult = await this.resumeSession(access.sessionId, namespace)
+        const resumeResult = await this.resumeSession(access.sessionId, namespace, opts)
         if (resumeResult.type === 'error') {
             return resumeResult
         }

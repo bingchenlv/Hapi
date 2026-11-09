@@ -1,3 +1,13 @@
+export const MINIMAX_MODEL = 'MiniMax-M3.1-Flash'
+export const DEEPSEEK_MODELS = ['deepseek-flash', 'deepseek-v4-pro'] as const
+export const DEEPSEEK_EFFORTS = ['low', 'high', 'max'] as const
+export function isDeepSeekModel(model: string | null | undefined): boolean {
+    return (DEEPSEEK_MODELS as readonly unknown[]).includes(model)
+}
+export function isMiniMaxModel(model: string | null | undefined): boolean {
+    return model === MINIMAX_MODEL || model === 'MiniMax-M3.1-Flash-Preview'
+}
+
 export const CLAUDE_MODEL_LABELS = {
     sonnet: 'Sonnet',
     'sonnet[1m]': 'Sonnet 1M',

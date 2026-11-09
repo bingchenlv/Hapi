@@ -102,6 +102,43 @@ describe('bootstrapExistingSession', () => {
         delete process.env[HAPI_SESSION_ID_ENV]
     })
 
+    it.each(['controller', 'research'] as const)('keeps a bound %s session identity and actual cwd on cold resume', async (role) => {
+        const session = createSession()
+        const originalPath = role === 'controller' ? '/workspace' : '/workspace/family-finance'
+        session.metadata = { ...session.metadata!, path: originalPath, project: {
+            id: 'FF', name: '家庭记账', directory: '/workspace/family-finance', controllerSessionId: 'controller', role
+        } }
+        const client = { updateMetadata: vi.fn() }
+        getSessionMock.mockResolvedValue(session)
+        getOrCreateMachineMock.mockResolvedValue({ id: 'machine-1' })
+        sessionSyncClientMock.mockReturnValue(client)
+        readSettingsMock.mockResolvedValue({ machineId: 'machine-1' })
+        const result = await bootstrapExistingSession({ sessionId: session.id, flavor: 'codex', workingDirectory: '/wrong/runtime',
+            preserveProjectWorkingDirectory: true, reportStarted: false, exportSessionEnv: false })
+        expect(result.sessionInfo.id).toBe(session.id)
+        expect(result.workingDirectory).toBe(originalPath)
+        expect(result.metadata.path).toBe(originalPath)
+        expect(result.metadata.codexSessionId).toBe('codex-thread-1')
+        expect(result.metadata.project).toEqual(session.metadata.project)
+        const write = client.updateMetadata.mock.calls[0][0] as (metadata: NonNullable<Session['metadata']>) => Session['metadata']
+        expect(write(session.metadata)?.project).toEqual(session.metadata.project)
+        expect(write(session.metadata)?.path).toBe(originalPath)
+        expect(process.env[HAPI_SESSION_ID_ENV]).toBeUndefined()
+    })
+
+    it('does not change unbound resume directory semantics', async () => {
+        const session = createSession()
+        getSessionMock.mockResolvedValue(session)
+        getOrCreateMachineMock.mockResolvedValue({ id: 'machine-1' })
+        sessionSyncClientMock.mockReturnValue({ updateMetadata: vi.fn() })
+        readSettingsMock.mockResolvedValue({ machineId: 'machine-1' })
+        const result = await bootstrapExistingSession({ sessionId: session.id, flavor: 'codex', workingDirectory: '/requested/directory',
+            preserveProjectWorkingDirectory: true, reportStarted: false, exportSessionEnv: false })
+        expect(result.workingDirectory).toBe('/requested/directory')
+        expect(result.metadata.path).toBe('/requested/directory')
+        expect(result.metadata.project).toBeUndefined()
+    })
+
     it('loads an existing HAPI session and reports it to the runner', async () => {
         const session = createSession()
         const sessionClient = {
@@ -135,6 +172,22 @@ describe('bootstrapExistingSession', () => {
         )
     })
 
+    it.each(['user', 'auto_review', undefined] as const)('preserves an existing MiniMax reviewer preference %s on cold resume', async preference => {
+        const session = createSession()
+        session.metadata = { ...session.metadata!, codexFullAuto: true, codexApprovalPolicy: 'never',
+            ...(preference === undefined ? {} : { minimaxApprovalReviewer: preference }) }
+        const client = { updateMetadata: vi.fn() }
+        getSessionMock.mockResolvedValue(session)
+        getOrCreateMachineMock.mockResolvedValue({ id: 'machine-1' })
+        sessionSyncClientMock.mockReturnValue(client)
+        readSettingsMock.mockResolvedValue({ machineId: 'machine-1' })
+        const result = await bootstrapExistingSession({ sessionId: session.id, flavor: 'codex', workingDirectory: '/tmp/project', reportStarted: false, exportSessionEnv: false })
+        expect(result.metadata.minimaxApprovalReviewer).toBe(preference)
+        expect(result.metadata).toMatchObject({ codexFullAuto: true, codexApprovalPolicy: 'never' })
+        const update = client.updateMetadata.mock.calls[0][0] as (metadata: NonNullable<Session['metadata']>) => Session['metadata']
+        expect(update(session.metadata)?.minimaxApprovalReviewer).toBe(preference)
+    })
+
     it('preserves existing native resume metadata when reactivating a session', async () => {
         const session = createSession()
         const existingMetadata = session.metadata
@@ -144,6 +197,15 @@ describe('bootstrapExistingSession', () => {
             ...existingMetadata,
             claudeSessionId: 'claude-thread-1',
             codexSessionId: 'codex-thread-1',
+            codexProviderHistory: { previousThreadIds: ['original-thread'], inheritedTurnIds: ['original-turn'], turnOrigins: { 'original-turn': 'original-thread' } },
+            modelRouting: { provider: 'openai', reason: 'manual', status: 'active', updatedAt: 123, openaiApprovalsReviewer: 'auto_review' },
+            modelReasoningEfforts: { 'gpt-6.1-sol': 'high', 'MiniMax-M3.1-Flash-Preview': 'max' },
+            hybridModel: { mode: 'openai' },
+            codexRateLimits: {
+                primary: { usedPercent: 42, windowDurationMins: 300 },
+                secondary: { usedPercent: 18, windowDurationMins: 10_080 },
+                updatedAt: 1_700_000_000_000
+            },
             geminiSessionId: 'gemini-thread-1',
             opencodeSessionId: 'opencode-thread-1',
             grokSessionId: 'grok-thread-1',
@@ -190,6 +252,15 @@ describe('bootstrapExistingSession', () => {
         expect(result.metadata).toEqual(expect.objectContaining({
             claudeSessionId: 'claude-thread-1',
             codexSessionId: 'codex-thread-1',
+            codexProviderHistory: { previousThreadIds: ['original-thread'], inheritedTurnIds: ['original-turn'], turnOrigins: { 'original-turn': 'original-thread' } },
+            modelRouting: { provider: 'openai', reason: 'manual', status: 'active', updatedAt: 123, openaiApprovalsReviewer: 'auto_review' },
+            modelReasoningEfforts: { 'gpt-6.1-sol': 'high', 'MiniMax-M3.1-Flash-Preview': 'max' },
+            hybridModel: { mode: 'openai' },
+            codexRateLimits: {
+                primary: { usedPercent: 42, windowDurationMins: 300 },
+                secondary: { usedPercent: 18, windowDurationMins: 10_080 },
+                updatedAt: 1_700_000_000_000
+            },
             geminiSessionId: 'gemini-thread-1',
             opencodeSessionId: 'opencode-thread-1',
             grokSessionId: 'grok-thread-1',
@@ -223,6 +294,7 @@ describe('bootstrapExistingSession', () => {
         const updateHandler = sessionClient.updateMetadata.mock.calls[0][0]
         expect(updateHandler(session.metadata)).toEqual(expect.objectContaining({
             codexSessionId: 'codex-thread-1',
+            codexRateLimits: expect.objectContaining({ updatedAt: 1_700_000_000_000 }),
             grokSessionId: 'grok-thread-1',
             conversationHistoryEntryIds: { 'local-user-1': 'pi-entry-1' }
         }))
@@ -230,6 +302,7 @@ describe('bootstrapExistingSession', () => {
             'hapi-session-1',
             expect.objectContaining({
                 codexSessionId: 'codex-thread-1',
+                codexRateLimits: expect.objectContaining({ updatedAt: 1_700_000_000_000 }),
                 grokSessionId: 'grok-thread-1',
                 conversationHistoryEntryIds: { 'local-user-1': 'pi-entry-1' }
             })

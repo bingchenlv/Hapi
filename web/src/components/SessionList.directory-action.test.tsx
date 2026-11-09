@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
@@ -12,8 +12,15 @@ const SEARCH_PLACEHOLDER = 'Search title/path/Agent/machine/ID…'
 
 afterEach(() => {
     cleanup()
+    localStorage.removeItem('hapi-lang')
     localStorage.removeItem('hapi-session-preview-limit')
     localStorage.removeItem('hapi-pin-in-progress-sessions')
+})
+
+beforeEach(() => {
+    // This suite asserts the English UI copy, so pin the locale instead of
+    // inheriting the Chinese product default.
+    localStorage.setItem('hapi-lang', 'en')
 })
 
 function makeSession(overrides: Partial<SessionSummary> & { id: string }): SessionSummary {
@@ -59,6 +66,26 @@ function renderWithProviders(children: ReactNode) {
 }
 
 describe('SessionList directory action', () => {
+    it('keeps active project members together and starts from their real controller reference', async () => {
+        localStorage.setItem('hapi-pin-in-progress-sessions', 'true')
+        const project = { id: 'FF', name: '家庭记账', directory: '/project', controllerSessionId: 'ctrl', role: 'controller' as const }
+        const sessions = [makeSession({ id: 'ctrl', active: true, thinking: true, globalPinned: true, metadata: {
+            path: '/workspace', machineId: 'm1', name: 'Main', flavor: 'codex', project
+        } }), makeSession({ id: 'a', active: true, pendingRequestsCount: 1, metadata: {
+            path: '/project', machineId: 'm1', name: 'Draft', flavor: 'codex', project: { ...project, role: 'research' }
+        } })]
+        const onNewSessionInDirectory = vi.fn()
+        renderWithProviders(<SessionList api={null} sessions={sessions} selectedSessionId="ctrl" onSelect={vi.fn()} onNewSession={vi.fn()}
+            onNewSessionInDirectory={onNewSessionInDirectory} onRefresh={vi.fn()} isLoading={false} />)
+        const group = await screen.findByRole('group', { name: '家庭记账' })
+        expect(within(group).getByRole('button', { name: /Main/ })).toBeInTheDocument()
+        expect(within(group).getByRole('button', { name: /Draft/ })).toBeInTheDocument()
+        const create = within(group).getByRole('button', { name: 'New session in this directory' })
+        fireEvent.click(create)
+        expect(onNewSessionInDirectory).toHaveBeenCalledWith({ machineId: 'm1', directory: '/project', sourceProjectSessionId: 'ctrl' })
+        expect(sessions[0].metadata?.path).toBe('/workspace')
+    })
+
     it('starts a new session with the project machine and directory', () => {
         const onNewSessionInDirectory = vi.fn()
         const session = makeSession({

@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { configuration } from '@/configuration';
 import { getProcessStartMarker, isProcessAlive } from '@/utils/process';
 import { withSettingsFileLock } from '@hapi/protocol/settingsFileLock';
+import { RETIREMENT_STATUSES } from './providerRetirement';
 
 const RuntimeSchema = z.object({
     id: z.string(), pid: z.number().int().positive(), marker: z.string(),
@@ -14,6 +15,15 @@ const RuntimeSchema = z.object({
     endpoint: z.string(), token: z.string().optional(),
     command: z.string(), args: z.array(z.string()), codexHome: z.string(), hub: z.string(), authHash: z.string(),
     pendingCreations: z.array(z.string()).optional(),
+    retiredProviderThreads: z.record(z.string(), z.string()).optional(),
+    // Durable cleanup state for retired native threads. Optional so records
+    // written by older runtimes still parse, and so an unknown future status
+    // never invalidates an otherwise readable ownership record.
+    providerRetirements: z.record(z.string(), z.object({
+        threadId: z.string(), sessionId: z.string(),
+        status: z.enum(RETIREMENT_STATUSES).catch('unconfirmed'),
+        requestedAt: z.number().optional(), completedAt: z.number().optional(), error: z.string().optional()
+    }).passthrough()).optional(),
     sessions: z.record(z.string(), z.object({ threadId: z.string(), namespace: z.string(), active: z.boolean() }))
 });
 export type CodexRuntimeRecord = z.infer<typeof RuntimeSchema>;
@@ -83,7 +93,8 @@ export async function withThreadOwnership<T>(home: string, threadId: string, own
             if (owner.pendingCreations?.length && runtimeMayBeAlive(owner)) {
                 throw new Error(`Codex runtime ${owner.id} has an unconfirmed creation. Inspect/stop that runtime before cold resume; its thread ID may be unknown.`);
             }
-            const match = Object.entries(owner.sessions).find(([, session]) => session.threadId === threadId && session.active);
+            const match = Object.entries(owner.sessions).find(([sid, session]) => session.active
+                && (session.threadId === threadId || owner.retiredProviderThreads?.[threadId] === sid));
             if (!match) continue;
             const orphanAlive = owner.serverPid && generationMayBeAlive(owner.serverPid, owner.serverMarker);
             if (generationMayBeAlive(owner.pid, owner.marker) || orphanAlive) {
@@ -100,8 +111,15 @@ export async function findRuntime(sessionId: string): Promise<CodexRuntimeRecord
 }
 
 export async function findColdBinding(home: string, threadId: string): Promise<string | undefined> {
-    for (const owner of await readRuntimes()) {
-        if (owner.codexHome !== home || owner.hub !== configuration.apiUrl || owner.authHash !== runtimeAuthHash()) continue;
+    const owners = (await readRuntimes()).filter(owner => owner.codexHome === home
+        && owner.hub === configuration.apiUrl && owner.authHash === runtimeAuthHash());
+    // Check every generation before an old direct binding can win. Retired
+    // IDs must not silently create a new session or revive an obsolete thread.
+    for (const owner of owners) {
+        const sessionId = owner.retiredProviderThreads?.[threadId];
+        if (sessionId) throw new Error(`This native thread was retired after a model-provider change. Use hapi resume ${sessionId} to attach its current thread.`);
+    }
+    for (const owner of owners) {
         const match = Object.entries(owner.sessions).find(([, session]) => session.threadId === threadId);
         if (match) return match[0];
     }

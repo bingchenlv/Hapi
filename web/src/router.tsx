@@ -210,12 +210,11 @@ function SessionsPage() {
     useSelectedSessionSeen(selectedSessionId, selectedSession?.updatedAt)
     const isSessionsIndex = pathname === '/sessions' || pathname === '/sessions/'
     const sidebar = useSidebarResize()
-    const handleNewSessionInDirectory = useCallback((args: { machineId: string | null; directory: string }) => {
+    const handleNewSessionInDirectory = useCallback((args: { machineId: string | null; directory: string; sourceProjectSessionId?: string }) => {
         navigate({
             to: '/sessions/new',
-            search: args.machineId
-                ? { directory: args.directory, machineId: args.machineId }
-                : { directory: args.directory },
+            search: { directory: args.directory, ...(args.machineId ? { machineId: args.machineId } : {}),
+                ...(args.sourceProjectSessionId ? { sourceProjectSessionId: args.sourceProjectSessionId } : {}) },
             ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [navigate])
@@ -902,7 +901,7 @@ function NewSessionPage() {
     const queryClient = useQueryClient()
     const { machines, isLoading: machinesLoading, error: machinesError } = useMachines(api, true)
     const { t } = useTranslation()
-    const { directory: initialDirectory, machineId: initialMachineId, shareTransferId } = newSessionRoute.useSearch()
+    const { directory: initialDirectory, machineId: initialMachineId, sourceProjectSessionId, shareTransferId } = newSessionRoute.useSearch()
 
     const handleCancel = useCallback(() => {
         if (shareTransferId) {
@@ -981,6 +980,7 @@ function NewSessionPage() {
                     onChooseFolder={handleChooseFolder}
                     initialDirectory={initialDirectory}
                     initialMachineId={initialMachineId}
+                    initialProjectSessionId={sourceProjectSessionId}
                 />
             </div>
         </div>
@@ -1141,6 +1141,7 @@ const sessionFileRoute = createRoute({
 })
 
 type NewSessionSearch = {
+    sourceProjectSessionId?: string
     directory?: string
     machineId?: string
     shareTransferId?: string
@@ -1151,6 +1152,9 @@ const newSessionRoute = createRoute({
     path: 'new',
     validateSearch: (search: Record<string, unknown>): NewSessionSearch => {
         const result: NewSessionSearch = {}
+        if (typeof search.sourceProjectSessionId === 'string' && search.sourceProjectSessionId) {
+            result.sourceProjectSessionId = search.sourceProjectSessionId
+        }
         if (typeof search.directory === 'string' && search.directory) {
             result.directory = search.directory
         }

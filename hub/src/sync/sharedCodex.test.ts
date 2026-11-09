@@ -51,9 +51,43 @@ describe('shared Codex hub binding', () => {
             const source = create('source'); const child = create('child')
             rpc.clearConversation = async () => ({ sessionId: child.id })
             expect(await engine.clearConversation(source.id, 'default')).toEqual({ sessionId: child.id })
+            expect(engine.getSession(child.id)?.metadata).toMatchObject({ name: 'Codex-01', codexAutoNameSequence: 1 })
             expect(engine.getSession(source.id)?.metadata?.supersededBySessionId).toBeUndefined()
             await expect(engine.switchSession(source.id, 'remote')).rejects.toThrow('control_mode_not_applicable')
             await expect(engine.clearConversation(source.id, 'other-namespace')).rejects.toThrow()
+        } finally { engine.stop() }
+    })
+
+    it('allocates the next namespace-local Codex number from names and durable high-water marks', async () => {
+        const { engine, create, rpc } = fixture()
+        try {
+            create('named', { name: 'Codex-02' })
+            create('renamed', { name: 'Task title', codexAutoNameSequence: 7 })
+            const source = create('source'); const child = create('child')
+            rpc.clearConversation = async () => ({ sessionId: child.id })
+
+            expect(await engine.clearConversation(source.id, 'default')).toEqual({ sessionId: child.id })
+            expect(engine.getSession(child.id)?.metadata).toMatchObject({ name: 'Codex-08', codexAutoNameSequence: 8 })
+        } finally { engine.stop() }
+    })
+
+    it('serializes concurrent /new numbering within a namespace', async () => {
+        const { engine, create, rpc } = fixture()
+        try {
+            create('existing', { name: 'Codex-01' })
+            const sourceA = create('source-a'); const sourceB = create('source-b')
+            const childA = create('child-a'); const childB = create('child-b')
+            rpc.clearConversation = async (sessionId) => ({
+                sessionId: sessionId === sourceA.id ? childA.id : childB.id
+            })
+
+            await Promise.all([
+                engine.clearConversation(sourceA.id, 'default'),
+                engine.clearConversation(sourceB.id, 'default')
+            ])
+
+            const assigned = [childA, childB].map((child) => engine.getSession(child.id)?.metadata?.name).sort()
+            expect(assigned).toEqual(['Codex-02', 'Codex-03'])
         } finally { engine.stop() }
     })
 })

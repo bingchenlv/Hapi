@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { compress } from 'hono/compress'
 import { cors } from 'hono/cors'
-import { logger } from 'hono/logger'
+import { requestTrace } from './middleware/requestTrace'
 import { join } from 'node:path'
 import { existsSync } from 'node:fs'
 import { serveStatic } from 'hono/bun'
@@ -231,7 +231,7 @@ function createWebApp(options: {
 }): Hono<WebAppEnv> {
     const app = new Hono<WebAppEnv>()
 
-    app.use('*', logger())
+    app.use('*', requestTrace())
 
     const configuration = getConfiguration()
     const corsOrigins = options.corsOrigins ?? configuration.corsOrigins
@@ -241,7 +241,8 @@ function createWebApp(options: {
         allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
         // last-event-id: browsers attach it to EventSource reconnects for
         // SSE replay; allow it in case a browser preflights the request.
-        allowHeaders: ['authorization', 'content-type', 'last-event-id']
+        allowHeaders: ['authorization', 'content-type', 'last-event-id', 'x-request-id'],
+        exposeHeaders: ['x-request-id']
     })
     app.use('/health', corsMiddleware)
     app.use('/api/*', corsMiddleware)
@@ -309,8 +310,8 @@ function createWebApp(options: {
     // Path is intentionally NOT `/api/events` — that route is the SSE stream.
     app.route('/api', createWorkGraphRoutes(options.store))
 
-    // Skip static serving in relay mode, show helpful message on root
-    if (options.relayMode) {
+    // Custom builds may opt into serving their bundled UI through the relay.
+    if (options.relayMode && process.env.HAPI_RELAY_SERVE_WEB !== '1') {
         const officialUrl = options.officialWebUrl || 'https://app.hapi.run'
         app.get('/', (c) => {
             return c.html(`<!DOCTYPE html>

@@ -1,3 +1,4 @@
+import type { SessionProject } from '@hapi/protocol'
 import type { AgentFlavor, CodexCollaborationMode, CopilotAgentMode, PermissionMode } from '@hapi/protocol/types'
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
 import {
@@ -40,6 +41,7 @@ import type {
 } from '@hapi/protocol/apiTypes'
 import type { Server } from 'socket.io'
 import type { RpcRegistry } from '../socket/rpcRegistry'
+import { mapSpawnRpcResult, type SpawnRpcOutcome } from './spawnRpcResult'
 
 const DEFAULT_RPC_TIMEOUT_MS = 30_000
 const MODEL_LIST_RPC_TIMEOUT_MS = 120_000
@@ -97,6 +99,12 @@ export type RpcListAgyModelsResponse = AgyModelsResponse
 export type RpcListPiModelsResponse = PiModelsResponse
 
 export class RpcGateway {
+    async hybridModel(sessionId: string, mode?: 'openai' | 'hybrid'): Promise<unknown> {
+        return this.sessionRpc(sessionId, RPC_METHODS.HybridModel, mode ? { mode } : {});
+    }
+    async deepseekCollaboration(sessionId: string, mode?: 'openai' | 'hybrid'): Promise<unknown> {
+        return this.sessionRpc(sessionId, RPC_METHODS.DeepSeekCollaboration, mode ? { mode } : {});
+    }
     constructor(
         private readonly io: Server,
         private readonly rpcRegistry: RpcRegistry
@@ -190,22 +198,17 @@ export class RpcGateway {
         // Hub session id to reuse for this spawn. When set, the runner boots the
         // CLI with `--hapi-session-id`, so the child reuses the existing hub
         // session row (same id) instead of minting a new one.
-        forkSession?: boolean
-    ): Promise<
-        | { type: 'success'; sessionId: string }
-        | {
-            type: 'error'
-            message: string
-            code?: 'agent_unavailable' | 'outside_workspace_roots'
-            agent?: AgentFlavor
-        }
-    > {
+        forkSession?: boolean,
+        sessionProject?: SessionProject,
+        requestId?: string
+    ): Promise<SpawnRpcOutcome> {
         try {
             const result = await this.machineRpc(
                 machineId,
                 RPC_METHODS.SpawnHappySession,
                 {
                     type: 'spawn-in-directory',
+                    requestId,
                     directory,
                     agent,
                     model,
@@ -222,46 +225,11 @@ export class RpcGateway {
                     collaborationMode,
                     copilotAgentMode,
                     startingMode,
+                    sessionProject,
                     forkSession: forkSession === true
                 }
             )
-            if (result && typeof result === 'object') {
-                const obj = result as Record<string, unknown>
-                if (obj.type === 'success' && typeof obj.sessionId === 'string') {
-                    return { type: 'success', sessionId: obj.sessionId }
-                }
-                if (obj.type === 'error' && typeof obj.errorMessage === 'string') {
-                    const code = obj.code === 'agent_unavailable' || obj.code === 'outside_workspace_roots'
-                        ? obj.code
-                        : undefined
-                    const unavailableAgent = typeof obj.agent === 'string' ? obj.agent as AgentFlavor : undefined
-                    return {
-                        type: 'error',
-                        message: obj.errorMessage,
-                        ...(code ? { code } : {}),
-                        ...(unavailableAgent ? { agent: unavailableAgent } : {}),
-                    }
-                }
-                if (obj.type === 'requestToApproveDirectoryCreation' && typeof obj.directory === 'string') {
-                    return { type: 'error', message: `Directory creation requires approval: ${obj.directory}` }
-                }
-                if (typeof obj.error === 'string') {
-                    return { type: 'error', message: obj.error }
-                }
-                if (obj.type !== 'success' && typeof obj.message === 'string') {
-                    return { type: 'error', message: obj.message }
-                }
-            }
-            const details = typeof result === 'string'
-                ? result
-                : (() => {
-                    try {
-                        return JSON.stringify(result)
-                    } catch {
-                        return String(result)
-                    }
-                })()
-            return { type: 'error', message: `Unexpected spawn result: ${details}` }
+            return mapSpawnRpcResult(result)
         } catch (error) {
             return { type: 'error', message: error instanceof Error ? error.message : String(error) }
         }

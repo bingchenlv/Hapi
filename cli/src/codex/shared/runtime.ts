@@ -2,7 +2,9 @@ import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { createServer } from 'node:net';
 import { mkdir, mkdtemp, chmod, rm, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
+import { assertProviderHistoryPreserved } from './providerHistoryAcceptance';
 import { tmpdir } from 'node:os';
+import { inheritSessionProject, MINIMAX_MODEL, type SessionProject } from '@hapi/protocol';
 import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { configuration } from '@/configuration';
 import { bootstrapSession, bootstrapExistingSession } from '@/agent/sessionFactory';
@@ -14,6 +16,12 @@ import { codexHome, saveRuntime, runtimeDirectory, runtimeAuthHash, findColdBind
 import { startCodexGateway, record, string, type Envelope } from './gateway';
 import { resolveSharedCodex, sharedLaunchConfig, initializeSharedClient, checkSharedCapabilities, type SharedLaunchOptions } from './launch';
 import { SharedCodexRoot } from './root';
+import { minimaxAvailable, minimaxServerArgs, minimaxProviderConfig } from './minimax';
+import { startMiniMaxReviewRouter } from './minimaxReviewRouter';
+import { prepareMiniMaxCatalog } from './nativeMiniMaxCatalog';
+import { deepseekAvailable, deepseekServerArgs, prepareDeepSeekCatalog } from './deepseek';
+import { providerHistorySnapshot, type ProviderHistorySnapshot } from './providerHistory';
+import { createRetirementStore, retireProviderThread } from './providerRetirement';
 
 export type RuntimeReady = { sessionId: string; runtime: CodexRuntimeRecord };
 type Reservation = { root: SharedCodexRoot; resumeId?: string };
@@ -55,7 +63,17 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
     const env: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: home };
     // Every thread injects its own identity. A launch from another agent must not inherit that root's identity.
     delete env.HAPI_SESSION_ID;
+    delete env.HAPI_SESSION_PROJECT;
     let server: ChildProcess | undefined;
+    let reviewRouter: Awaited<ReturnType<typeof startMiniMaxReviewRouter>> | undefined;
+    let minimaxCatalogUnavailable = false;
+    let deepseekReady = false;
+    const catalogWarnings = new Set<string>();
+    const warnCatalog = (root: SharedCodexRoot, response: Record<string, unknown>) => {
+        if (!minimaxCatalogUnavailable || response.model !== MINIMAX_MODEL || catalogWarnings.has(root.session.sessionId)) return;
+        catalogWarnings.add(root.session.sessionId);
+        root.session.sendSessionEvent({ type: 'message', message: 'MiniMax 原生模型目录暂不可用，当前沿用原生默认上下文及自动压缩继续工作；本次未确认百万上下文。权限和模型请求重试规则保持不变。' });
+    };
     let gateway: Awaited<ReturnType<typeof startCodexGateway>> | undefined;
     let stopping = false;
     let failure: unknown;
@@ -72,8 +90,11 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
     const done = new Promise<void>(resolve => { finish = resolve; });
     const ending = new Set<SharedCodexRoot>();
     const roots = new Map<string, SharedCodexRoot>();
+    const switchingProviders = new Set<string>();
+    let providerChanges: Promise<unknown> = Promise.resolve();
     const prepared = new Set<SharedCodexRoot>();
     const reservations = new Map<string, Reservation>();
+    const connectionSources = new Map<string, SharedCodexRoot>();
     const runtime: CodexRuntimeRecord = { id, pid: process.pid, marker: getProcessStartMarker(process.pid) ?? '',
         endpoint: '', command: command.command, args: command.args, codexHome: home, hub: configuration.apiUrl, authHash: runtimeAuthHash(), sessions: {} };
     if (!runtime.marker) throw new Error('Cannot verify the runtime process generation');
@@ -146,6 +167,7 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
             failure ??= error;
             logger.debug('[Codex shared] shutdown', error);
         }).finally(async () => {
+            await reviewRouter?.close();
             await Promise.allSettled([...prepared].map(root => root.close(ending.has(root))));
             await rm(sockets, { recursive: true, force: true }).catch(error => logger.debug('[Codex shared] socket cleanup', error));
             finish();
@@ -167,16 +189,17 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
             }).catch(error => logger.debug('[Codex shared] root cleanup', error));
         }, 100);
     };
-    const prepare = async (cwd: string, existingSessionId?: string, parent?: SharedCodexRoot): Promise<SharedCodexRoot> => {
+    const prepare = async (cwd: string, existingSessionId?: string, parent?: SharedCodexRoot, project?: SessionProject): Promise<SharedCodexRoot> => {
         assertRunning();
         const shared = { flavor: 'codex', startedBy: options.startedBy ?? 'terminal', workingDirectory: cwd,
             exportSessionEnv: false, reportStarted: false, metadataOverrides: { capabilities: { terminal: true, concurrentClients: true },
-                ...(parent ? { forkedFrom: parent.session.sessionId } : {}) } } as const;
+                ...(parent ? { forkedFrom: parent.session.sessionId } : {}), ...(project ? { project } : {}) } } as const;
         const bootstrap = existingSessionId
-            ? await bootstrapExistingSession({ ...shared, sessionId: existingSessionId })
+            ? await bootstrapExistingSession({ ...shared, sessionId: existingSessionId, preserveProjectWorkingDirectory: true })
             : await bootstrapSession({ ...shared, agentState: { controlledByUser: false } });
         const root = new SharedCodexRoot(bootstrap, { directory: join(runtimeDirectory(), 'queues'), generation: id, endpoint: upstream, token: upstreamToken,
-            settingsFor: threadId => nativeSettings.get(threadId), create, end });
+            settingsFor: threadId => nativeSettings.get(threadId), create, end, switchProvider, deepseekReady,
+            resetReviewTransport: () => reviewRouter?.reset() });
         prepared.add(root);
         try { assertRunning(); await root.prepare(); assertRunning(); return root; }
         catch (error) { await root.close(!stopping && !existingSessionId); prepared.delete(root); throw error; }
@@ -190,6 +213,24 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
         runtime.pendingCreations = runtime.pendingCreations?.filter(sid => sid !== root.session.sessionId); await persist();
     };
     const reserve = async (root: SharedCodexRoot, threadId: string) => withThreadOwnership(home, threadId, id, () => reserveRecord(root, threadId));
+    // Called while holding ownership, before any native resume is sent. Local
+    // reservation failure is not an uncertain native mutation. Release only
+    // this prepared connection; never archive an existing conversation.
+    const prepareResume = async (cwd: string, threadId: string, explicitSessionId?: string) => {
+        const coldBinding = await findColdBinding(home, threadId);
+        const root = await prepare(cwd, explicitSessionId ?? coldBinding);
+        try { await reserveRecord(root, threadId); return root; }
+        catch (error) {
+            const binding = runtime.sessions[root.session.sessionId];
+            if (binding?.threadId === threadId) {
+                binding.active = false;
+                await persist().catch(cleanupError => logger.debug('[Codex shared] failed reservation state cleanup', cleanupError));
+            }
+            await root.close(false).then(() => prepared.delete(root))
+                .catch(cleanupError => logger.debug('[Codex shared] failed reservation connection cleanup', cleanupError));
+            throw error;
+        }
+    };
     const bind = async (root: SharedCodexRoot, response: Record<string, unknown>, subscribe: boolean, initialOptions?: SharedLaunchOptions) => {
         assertRunning();
         const threadId = string(record(response.thread).id);
@@ -207,12 +248,13 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
         // new-thread subscription. Subscribe once without changing settings.
         await control.request('thread/resume', { threadId });
         await root.activate(initialOptions);
+        warnCatalog(root, response);
         await root.session.flush();
         await persist();
         await notifyRunnerSessionStarted(root.session.sessionId, root.session.getMetadata() ?? root.bootstrap.metadata);
     };
-    const create = (method: 'thread/start' | 'thread/fork', params: Record<string, unknown>, parent?: SharedCodexRoot, initialOptions?: SharedLaunchOptions): Promise<SharedCodexRoot> => operation(async () => {
-        const root = await prepare(string(params.cwd) ?? launch.cwd, undefined, parent);
+    const create = (method: 'thread/start' | 'thread/fork', params: Record<string, unknown>, parent?: SharedCodexRoot, project?: SessionProject, initialOptions?: SharedLaunchOptions): Promise<SharedCodexRoot> => operation(async () => {
+        const root = await prepare(string(params.cwd) ?? launch.cwd, undefined, parent, project);
         let nativeSucceeded = false;
         try {
             runtime.pendingCreations = [...runtime.pendingCreations ?? [], root.session.sessionId]; await persist();
@@ -229,9 +271,148 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
             throw error;
         }
     });
+    // Durable cleanup state for the native threads a provider switch retires.
+    const retirementStore = createRetirementStore(runtime.providerRetirements, records => { runtime.providerRetirements = records; });
+    /**
+     * Release the native resources of the thread a committed provider switch
+     * left behind. The archive runs on the runtime's own native control
+     * connection: never through the Hub, never through a peer session, and
+     * never against the new thread, the current root or a sibling root. A
+     * cleanup problem is reported honestly and never fails the switch.
+     */
+    const retireRetiredThread = async (root: SharedCodexRoot, retiredThreadId: string, currentThreadId: string): Promise<void> => {
+        try {
+            const outcome = await retireProviderThread({
+                threadId: retiredThreadId,
+                sessionId: root.session.sessionId,
+                store: retirementStore,
+                persist: () => persist(),
+                archive: async threadId => { await control.request('thread/archive', { threadId }); },
+                // Only the thread this very switch released may be archived.
+                precondition: () => retiredThreadId !== currentThreadId
+                    && root.threadId !== retiredThreadId
+                    && ![...roots.values()].some(entry => entry.threadId === retiredThreadId),
+                classifyFailure: error => isIndeterminateError(error) ? 'unconfirmed' : 'rejected',
+                // The module already redacts failure text, so nothing raw is logged.
+                log: message => logger.debug(message),
+                notify: message => root.session.sendSessionEvent({ type: 'message', message })
+            });
+            if (outcome.status !== 'archived') logger.debug('[Codex shared] retired native thread not released',
+                { threadId: retiredThreadId, status: outcome.status, detail: outcome.detail, error: outcome.error });
+        } catch (error) {
+            // A cleanup problem never turns a committed provider switch into a failed switch.
+            logger.debug('[Codex shared] retirement raised', error);
+        }
+    };
+    const switchProvider = (root: SharedCodexRoot, params: Record<string, unknown>, beforeFork: () => Promise<void>): Promise<Record<string, unknown>> => {
+        const change = providerChanges.catch(() => {}).then(() => operation(async () => {
+            const previousThreadId = root.threadId;
+            switchingProviders.add(previousThreadId);
+            let forkSucceeded = false;
+            let creationReserved = false;
+            let historySnapshot: ProviderHistorySnapshot | undefined;
+            let committed: Record<string, unknown> | undefined;
+            let retired: { retiredThreadId: string; currentThreadId: string } | undefined;
+            try {
+                assertRunning();
+                if (runtime.pendingCreations?.includes(root.session.sessionId)) throw new Error('A prior native mutation is unconfirmed; inspect the runtime before switching again');
+                root.assertProviderTransition();
+                await gateway?.drain(previousThreadId);
+                await beforeFork();
+                // A failed parent must not duplicate a still-running child tool.
+                // Wait for its native activity to settle while other roots keep running.
+                for (;;) {
+                    root.assertProviderTransition();
+                    let activeChild = false; let cursor: string | undefined;
+                    do {
+                        const children = record(await control.request('thread/list', { ancestorThreadId: previousThreadId, cursor,
+                            sourceKinds: ['subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther'] }));
+                        activeChild ||= (Array.isArray(children.data) ? children.data : []).some(value => record(record(value).status).type === 'active');
+                        cursor = string(children.nextCursor);
+                    } while (cursor && !activeChild);
+                    if (!activeChild) break;
+                    await new Promise(resolve => setTimeout(resolve, 250));
+                }
+                const thread = await root.readThread();
+                const turns = (Array.isArray(thread.turns) ? thread.turns : []).map(record);
+                if (turns.some(turn => turn.status === 'inProgress')) throw new Error('Wait for this turn to finish before switching providers');
+                root.assertProviderTransition();
+                if (params.modelProvider !== 'hapi_minimax') {
+                    const sourcePath = string(thread.path);
+                    if (!sourcePath) throw new Error('Native provider history has no rollout path');
+                    historySnapshot = await providerHistorySnapshot(home, previousThreadId, sourcePath, async threadId => {
+                        const ancestor = record(record(await root.client.request('thread/read', { threadId, includeTurns: false })).thread);
+                        const path = string(ancestor.path);
+                        if (!path || ancestor.id !== threadId) throw new Error('Native provider ancestor was not confirmed');
+                        return path;
+                    }, { dropAllReasoning: params.modelProvider === 'hapi_deepseek' });
+                    root.assertProviderTransition();
+                }
+                runtime.pendingCreations = [...runtime.pendingCreations ?? [], root.session.sessionId]; await persist();
+                creationReserved = true;
+                const response = record(await root.client.request('thread/fork', root.config({ ...params,
+                    threadId: previousThreadId, ...(historySnapshot ? { path: historySnapshot.path } : {}), deferGoalContinuation: true })));
+                const nextThreadId = string(record(response.thread).id);
+                forkSucceeded = Boolean(nextThreadId);
+                // Paginated native forks reference this sanitized prefix after
+                // cold resume; it is durable history, not a disposable import.
+                if (forkSucceeded) historySnapshot?.retain();
+                if (!nextThreadId || response.modelProvider !== params.modelProvider || response.model !== params.model) {
+                    throw new Error('Native provider fork was not confirmed');
+                }
+                if (historySnapshot) assertProviderHistoryPreserved(thread, await root.readThread(nextThreadId));
+                await withThreadOwnership(home, nextThreadId, id, async () => {
+                    runtime.retiredProviderThreads = { ...runtime.retiredProviderThreads, [previousThreadId]: root.session.sessionId };
+                    runtime.sessions[root.session.sessionId].threadId = nextThreadId;
+                    await persist();
+                    roots.delete(previousThreadId); roots.set(nextThreadId, root);
+                    nativeSettings.set(nextThreadId, { ...response, effort: response.reasoningEffort });
+                    await root.bindProviderThread(response, turns.map(turn => string(turn.id)).filter((value): value is string => Boolean(value)));
+                    await control.request('thread/resume', { threadId: nextThreadId });
+                    await root.session.flush();
+                    runtime.pendingCreations = runtime.pendingCreations?.filter(sid => sid !== root.session.sessionId); await persist();
+                });
+                // The fork, the rebinding, the alias and the pending commit are durable.
+                // The retirement itself runs after this switch's own failure path,
+                // so a cleanup problem can never make a committed switch look failed.
+                retired = { retiredThreadId: previousThreadId, currentThreadId: nextThreadId };
+                committed = response;
+            } catch (error) {
+                // Definite native rejection is safe to clear. Unknown fork outcomes
+                // retain the existing ownership quarantine and are never replayed.
+                if (creationReserved && !isIndeterminateError(error) && !forkSucceeded && root.threadId === previousThreadId) {
+                    runtime.pendingCreations = runtime.pendingCreations?.filter(sid => sid !== root.session.sessionId); await persist();
+                }
+                throw error;
+            } finally {
+                // Unknown fork outcomes retain the snapshot for inspection.
+                if (!creationReserved || forkSucceeded || !runtime.pendingCreations?.includes(root.session.sessionId)) await historySnapshot?.dispose();
+                switchingProviders.delete(previousThreadId);
+            }
+            if (!committed) throw new Error('The provider switch did not commit');
+            // Only now may the retired native thread release its resources.
+            if (retired) await retireRetiredThread(root, retired.retiredThreadId, retired.currentThreadId);
+            warnCatalog(root, committed);
+            return committed;
+        }));
+        providerChanges = change; return change;
+    };
     const key = (connection: string, request: Envelope) => `${connection}:${typeof request.id}:${request.id}`;
     const before = (request: Envelope, connection: string): Promise<Envelope> => operation(async () => {
         const params = record(request.params);
+        if (typeof params.threadId === 'string' && switchingProviders.has(params.threadId)) {
+            throw new Error('This session is switching model providers. Wait for confirmation before submitting.');
+        }
+        const retiredSessionId = typeof params.threadId === 'string' ? runtime.retiredProviderThreads?.[params.threadId] : undefined;
+        if (retiredSessionId) {
+            const current = [...roots.values()].find(root => root.session.sessionId === retiredSessionId);
+            if (current && request.method === 'thread/resume') {
+                return { ...request, params: current.config({ ...params, ...current.freshParams(), threadId: current.threadId }) };
+            }
+            if (!['thread/read', 'thread/turns/list', 'thread/items/list'].includes(request.method ?? '')) {
+                throw new Error('This conversation changed model providers. Resume the HAPI session to attach its current execution thread.');
+            }
+        }
         if (['thread/revert', 'thread/rollback'].includes(request.method ?? '')) {
             throw new Error('In-place rewind is unavailable with concurrent HAPI clients. Use /fork or Fork at message instead.');
         }
@@ -254,20 +435,27 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
             }
             if (candidate !== threadId && !existing) throw new Error('Resume the parent HAPI session before attaching a child agent');
         }
-        if (request.method === 'thread/resume' && existing) return { ...request, params: existing.config(params) };
+        if (request.method === 'thread/resume' && existing) {
+            return { ...request, params: existing.config(params) };
+        }
         if (threadId) await withThreadOwnership(home, threadId, id, async () => {});
-        const cwd = string(params.cwd) ?? existing?.bootstrap.workingDirectory ?? launch.cwd;
+        const attached = connectionSources.get(connection);
+        const source = existing ?? (request.method === 'thread/start' && attached && roots.get(attached.threadId) === attached ? attached : undefined);
+        const project = request.method === 'thread/resume' ? undefined
+            : inheritSessionProject(source?.session.getMetadata()?.project, source?.session.sessionId ?? '');
+        const cwd = request.method === 'thread/start' && project ? project.directory
+            : string(params.cwd) ?? existing?.bootstrap.workingDirectory ?? launch.cwd;
         const root = request.method === 'thread/resume' && threadId
-            ? await withThreadOwnership(home, threadId, id, async () => {
-                const root = await prepare(cwd, await findColdBinding(home, threadId));
-                await reserveRecord(root, threadId); return root;
-            }) : await prepare(cwd, undefined, request.method === 'thread/fork' ? existing : undefined);
+            ? await withThreadOwnership(home, threadId, id, () => prepareResume(cwd, threadId))
+            : await prepare(cwd, undefined, request.method === 'thread/fork' ? existing : undefined, project);
         try {
             if (request.method !== 'thread/resume') {
                 runtime.pendingCreations = [...runtime.pendingCreations ?? [], root.session.sessionId]; await persist();
             }
             reservations.set(key(connection, request), { root, resumeId: request.method === 'thread/resume' ? threadId : undefined });
-            return { ...request, params: root.config({ ...params, ...(request.method === 'thread/fork' ? { deferGoalContinuation: true } : {}) }) };
+            return { ...request, params: root.config({ ...params, ...(request.method === 'thread/fork' ? { deferGoalContinuation: true } : {}),
+                ...(request.method === 'thread/resume' && root.session.getMetadata()?.project ? { cwd: root.bootstrap.workingDirectory } : {}),
+                ...(request.method === 'thread/start' && project ? { cwd } : {}) }) };
         } catch (error) { prepared.delete(root); await root.close(true); throw error; }
     });
     const after = (request: Envelope, response: Envelope, connection: string): Promise<void | Envelope[]> => operation(async () => {
@@ -279,6 +467,7 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
                 await persist(); prepared.delete(reservation.root); await reservation.root.close(true); return;
             }
             await bind(reservation.root, record(response.result), true);
+            connectionSources.set(connection, reservation.root);
         } else if (request.method === 'thread/archive' && !response.error) {
             const root = roots.get(string(record(request.params).threadId) ?? ''); if (root) await end(root, false);
         } else if (request.method === 'thread/queue/delete' && !response.error && record(response.result).deleted === true) {
@@ -288,10 +477,12 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
         }
         if (!response.error && ['thread/start', 'thread/resume', 'thread/fork'].includes(request.method ?? '')) {
             const threadId = string(record(record(response.result).thread).id);
+            const attached = roots.get(threadId ?? '');
+            if (attached) connectionSources.set(connection, attached);
             // Native 0.154 resume responses omit collaboration mode. Replay
             // the authoritative settings notification after the response so
             // a newly attached TUI doesn't reset a Web-selected Plan mode.
-            return roots.get(threadId ?? '')?.replaySettings();
+            return attached?.replaySettings();
         }
         return undefined;
     });
@@ -301,7 +492,32 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
     startup = (async () => {
         if (abortSignal?.aborted) throw new Error('Codex startup canceled');
         assertRunning();
-        server = spawn(command.command, [...command.args, 'app-server', ...launch.serverArgs, '--listen', upstream,
+        if (minimaxAvailable()) reviewRouter = await startMiniMaxReviewRouter({ onReviewUnavailable: () => {
+            for (const root of roots.values()) void root.reviewUnavailable().catch(error => logger.debug('[Codex shared] review fallback unconfirmed', error));
+        } });
+        if (reviewRouter) env.HAPI_MINIMAX_TRANSPORT_TOKEN = reviewRouter.capability;
+        const providerArgs = [ ...(reviewRouter ? minimaxServerArgs(minimaxProviderConfig(reviewRouter.baseUrl)) : []),
+            ...(deepseekAvailable() ? deepseekServerArgs() : []) ];
+        let catalogArgs: string[] = [];
+        if (reviewRouter) {
+            try { catalogArgs = await prepareMiniMaxCatalog(command, launch.serverArgs, launch.cwd, env, sockets); }
+            catch {
+                // Optional metadata cannot take down every OpenAI/shared root.
+                // Unchanged native configuration remains authoritative, and
+                // router compaction compatibility supports fallback metadata.
+                minimaxCatalogUnavailable = true;
+                logger.debug('[Codex shared] MiniMax catalog unavailable; retaining native configuration and default context');
+            }
+        }
+        assertRunning();
+        if (deepseekAvailable()) {
+            try {
+                catalogArgs = await prepareDeepSeekCatalog(command, [...launch.serverArgs, ...catalogArgs], launch.cwd, env, sockets);
+                deepseekReady = true;
+            } catch { logger.debug('[Codex shared] DeepSeek catalog unavailable; DeepSeek selection disabled'); }
+        }
+        assertRunning();
+        server = spawn(command.command, [...command.args, 'app-server', ...launch.serverArgs, ...providerArgs, ...catalogArgs, '--listen', upstream,
             ...(upstreamToken ? ['--ws-auth', 'capability-token', '--ws-token-sha256', createHash('sha256').update(upstreamToken).digest('hex')] : [])],
             { cwd: launch.cwd, env, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
         server.stderr?.on('data', data => logger.debug('[Codex shared] app-server', data.toString()));
@@ -322,6 +538,7 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
         assertRunning();
         gateway = await startCodexGateway({ upstream, upstreamToken, path: process.platform === 'win32' ? undefined : join(sockets, 'clients.sock'), token,
             hooks: { before, after, disconnected: connection => {
+                connectionSources.delete(connection);
                 for (const [key, reservation] of reservations) {
                     if (!key.startsWith(`${connection}:`)) continue;
                     reservation.root.session.sendSessionEvent({ type: 'message', message: 'Native lifecycle outcome is unknown after transport loss. Do not retry blindly; inspect the shared runtime log.' });
@@ -351,12 +568,8 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
             }
             // Prove ownership before bootstrap can alter an existing HAPI
             // row's hostPid/metadata. Hold the lock until the reservation is durable.
-            root = await withThreadOwnership(home, threadId, id, async () => {
-                const existing = options.existingSessionId ?? await findColdBinding(home, threadId);
-                const root = await prepare(launch.cwd, existing);
-                await reserveRecord(root, threadId); return root;
-            });
-            const params = root.config({ ...launch.threadParams, threadId });
+            root = await withThreadOwnership(home, threadId, id, () => prepareResume(launch.cwd, threadId, options.existingSessionId));
+            const params = root.config({ ...launch.threadParams, threadId, ...(root.session.getMetadata()?.project ? { cwd: root.bootstrap.workingDirectory } : {}) });
             let response: Record<string, unknown>;
             try {
                 response = record(await root.client.request('thread/resume', params));
@@ -370,7 +583,7 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
                 response = record(await root.client.request('thread/resume', params));
             }
             await bind(root, response, false, options);
-        } else root = await create('thread/start', { ...launch.threadParams, cwd: launch.cwd }, undefined, options);
+        } else root = await create('thread/start', { ...launch.threadParams, cwd: launch.cwd }, undefined, options.sessionProject, options);
         assertRunning();
         onReady?.({ sessionId: root.session.sessionId, runtime });
     })();

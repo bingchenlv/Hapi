@@ -97,6 +97,16 @@ export function createMachinesRoutes(getSyncEngine: () => SyncEngine | null): Ho
             return c.json({ error: `${parsed.data.agent.toUpperCase()} only supports remote mode` }, 400)
         }
         const startingMode = parsed.data.startingMode
+        let sessionProject
+        if (parsed.data.sourceProjectSessionId) {
+            if (parsed.data.agent !== 'codex') return c.json({ error: 'Project sessions currently require Codex' }, 400)
+            try {
+                sessionProject = engine.projectForSpawn(parsed.data.sourceProjectSessionId, c.get('namespace'), machineId)
+                if (parsed.data.directory !== sessionProject.directory) return c.json({ error: 'Project directory does not match its source' }, 400)
+            } catch (error) {
+                return c.json({ error: error instanceof Error ? error.message : 'Project source unavailable' }, 400)
+            }
+        }
 
         const result = await engine.spawnSession(
             machineId,
@@ -114,7 +124,8 @@ export function createMachinesRoutes(getSyncEngine: () => SyncEngine | null): Ho
             undefined,
             parsed.data.collaborationMode,
             parsed.data.copilotAgentMode,
-            startingMode
+            startingMode,
+            sessionProject
         )
         return c.json(result)
     })

@@ -172,6 +172,7 @@ export function SessionRowSummary(props: {
                         className={`min-w-0 flex-1 truncate text-sm font-medium ${s.active ? 'text-[var(--app-fg)]' : 'text-[var(--app-hint)]'}`}
                         title={sessionName}
                     >
+                        {s.metadata?.project ? <span className="mr-1 text-xs text-[var(--app-hint)]">{t(s.metadata.project.role === 'controller' ? 'sessions.project.controller' : s.metadata.project.role === 'development' ? 'sessions.project.development' : 'sessions.project.research')} · </span> : null}
                         {sessionName}
                     </div>
                     {attention?.kind === 'unread' && nestedTooltips && attentionId ? (

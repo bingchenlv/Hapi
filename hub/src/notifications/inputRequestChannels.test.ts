@@ -103,7 +103,7 @@ describe('input-request notification channels', () => {
             const fields = init?.body as URLSearchParams
             expect(fields.get('title')).toBe(`HAPI ${expected.title}`)
             expect(fields.get('desp')).toBe(`${expected.body}\n\nhttps://hapi.example.com${expected.url}`)
-            return new Response('ok')
+            return Response.json({ code: 0 })
         })
         globalThis.fetch = fetchMock as unknown as typeof fetch
         try {

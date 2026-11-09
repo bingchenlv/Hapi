@@ -11,6 +11,8 @@ const harness = vi.hoisted(() => ({
     configReadCalls: [] as unknown[],
     configReadResponse: { config: {} } as { config: Record<string, unknown> },
     failConfigRead: false,
+    rateLimitsReadCalls: 0,
+    rateLimitsReadResponse: {} as unknown,
     setFeatureEnablementCalls: [] as unknown[],
     failSetFeatureEnablement: false,
     listCollaborationModeCalls: 0,
@@ -125,6 +127,11 @@ vi.mock('./codexAppServerClient', () => {
                 throw new Error('config/read unsupported');
             }
             return harness.configReadResponse;
+        }
+
+        async readRateLimits(): Promise<unknown> {
+            harness.rateLimitsReadCalls += 1;
+            return harness.rateLimitsReadResponse;
         }
 
         setNotificationHandler(handler: ((method: string, params: unknown) => void) | null): void {
@@ -1156,6 +1163,8 @@ function createSessionStub(
         requests: {},
         completedRequests: {}
     };
+    let metadata: Record<string, unknown> = { path: '/tmp/hapi-update', host: 'test-host', flavor: 'codex' };
+    const metadataUpdates: Array<Record<string, unknown>> = [];
 
     const rpcHandlers = new Map<string, (params: unknown) => unknown>();
     const client = {
@@ -1164,7 +1173,13 @@ function createSessionStub(
                 rpcHandlers.set(method, handler);
             }
         },
-        updateMetadata(_handler: (metadata: Record<string, unknown>) => Record<string, unknown>) {},
+        getMetadata() {
+            return metadata;
+        },
+        updateMetadata(handler: (metadata: Record<string, unknown>) => Record<string, unknown>) {
+            metadata = handler(metadata);
+            metadataUpdates.push(metadata);
+        },
         updateAgentState(handler: (state: FakeAgentState) => FakeAgentState) {
             agentState = handler(agentState);
         },
@@ -1252,7 +1267,9 @@ function createSessionStub(
         getModelReasoningEffort: () => currentModelReasoningEffort,
         getCollaborationMode: () => currentCollaborationMode,
         collaborationModes,
-        getAgentState: () => agentState
+        getAgentState: () => agentState,
+        getMetadata: () => metadata,
+        metadataUpdates
     };
 }
 
@@ -1407,6 +1424,8 @@ describe('codexRemoteLauncher', () => {
         harness.configReadCalls = [];
         harness.configReadResponse = { config: {} };
         harness.failConfigRead = false;
+        harness.rateLimitsReadCalls = 0;
+        harness.rateLimitsReadResponse = {};
         harness.setFeatureEnablementCalls = [];
         harness.failSetFeatureEnablement = false;
         harness.listCollaborationModeCalls = 0;
@@ -1533,6 +1552,36 @@ describe('codexRemoteLauncher', () => {
         expect(sessionEvents.filter((event) => event.type === 'ready').length).toBeGreaterThanOrEqual(1);
         expect(thinkingChanges).toContain(true);
         expect(session.thinking).toBe(false);
+    });
+
+    it('publishes the initial account limits and merges live partial updates', async () => {
+        harness.rateLimitsReadResponse = {
+            rateLimits: {
+                planType: 'plus',
+                primary: { usedPercent: 21, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+                secondary: { usedPercent: 9, windowDurationMins: 10_080, resetsAt: 1_800_100_000 }
+            }
+        };
+        const { session, getMetadata } = createSessionStub();
+
+        await codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(getMetadata().codexRateLimits).toMatchObject({
+            planType: 'plus',
+            primary: { usedPercent: 21, windowDurationMins: 300 },
+            secondary: { usedPercent: 9, windowDurationMins: 10_080 }
+        }));
+        expect(harness.rateLimitsReadCalls).toBe(1);
+
+        harness.dispatchNotification?.('account/rateLimits/updated', {
+            rateLimits: {
+                primary: { usedPercent: 34, windowDurationMins: 300, resetsAt: 1_800_000_100 }
+            }
+        });
+
+        expect(getMetadata().codexRateLimits).toMatchObject({
+            primary: { usedPercent: 34, windowDurationMins: 300 },
+            secondary: { usedPercent: 9, windowDurationMins: 10_080 }
+        });
     });
 
     it('forwards effective Codex context settings for fresh and resumed threads', async () => {

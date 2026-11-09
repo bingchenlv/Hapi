@@ -13,6 +13,7 @@ import {
 } from '@hapi/protocol/messages'
 import { isObject } from '@hapi/protocol'
 import type { MessageDeliveryMode, MessagesResponse, QueuedStateResponse } from '@hapi/protocol/apiTypes'
+import type { MaintenanceMessageRequest, MaintenanceMessageReceipt } from '@hapi/protocol/apiTypes'
 import type { Server } from 'socket.io'
 import { randomUUID } from 'node:crypto'
 import type { Store, CancelQueuedMessageResult } from '../store'
@@ -675,6 +676,10 @@ export class MessageService {
         sessionId: string,
         messageId: string
     ): Promise<RetryIndeterminateMessageResult> {
+        const maintenanceKey = this.store.getMaintenanceRequestKey(sessionId, messageId)
+        if (maintenanceKey) {
+            return { status: 'retry-unavailable', localId: maintenanceKey }
+        }
         const lookup = this.store.messages.lookupQueuedMessage(sessionId, messageId)
         if (lookup.status === 'absent') return { status: 'not-found' }
         if (lookup.status === 'invoked') {
@@ -838,6 +843,28 @@ export class MessageService {
         })
     }
 
+    sendMaintenanceMessage(sessionId: string, request: MaintenanceMessageRequest): MaintenanceMessageReceipt {
+        const stored = this.store.addMaintenanceMessage(sessionId, request)
+        const message = stored.message
+        const observed = this.store.getMaintenanceMessageReceipt(sessionId, request.requestKey)
+        if (!observed) throw new Error('Maintenance request receipt unavailable; delivery remains unknown')
+        const receipt: MaintenanceMessageReceipt = { ...observed, inserted: stored.inserted }
+        if (!stored.inserted || !message || receipt.state !== 'stored') return receipt
+        this.onSessionActivity?.(sessionId, message.createdAt)
+        this.io.of('/cli').to(`session:${sessionId}`).emit('update', {
+            id: message.id, seq: message.seq, createdAt: message.createdAt,
+            body: { t: 'new-message', sid: sessionId, message: {
+                id: message.id, seq: message.seq, createdAt: message.createdAt,
+                localId: message.localId, content: message.content
+            } }
+        })
+        this.publisher.emit({ type: 'message-received', sessionId, message: {
+            id: message.id, seq: message.seq, localId: message.localId, content: message.content,
+            createdAt: message.createdAt, invokedAt: message.invokedAt, scheduledAt: message.scheduledAt
+        } })
+        return receipt
+    }
+
     async sendMessage(
         sessionId: string,
         payload: {
@@ -862,8 +889,13 @@ export class MessageService {
         }
 
         const sentFrom = payload.sentFrom ?? 'webapp'
+        const metadata = this.store.sessions.getSession(sessionId)?.metadata as Metadata | null
+        // Native shared workers mirror/consume by localId. API callers may
+        // omit it; allocate it once before storing or dispatching so the CLI
+        // never invents a second identity for this same input.
+        const localId = payload.localId ?? (metadata?.capabilities?.concurrentClients && payload.scheduledAt == null ? randomUUID() : undefined)
         const deliveryMode = getNormalizedDeliveryMode(
-            this.store.sessions.getSession(sessionId)?.metadata,
+            metadata,
             payload.deliveryMode,
             payload.scheduledAt
         )
@@ -884,7 +916,7 @@ export class MessageService {
         const inserted = this.store.addMessageForCurrentSession(
             sessionId,
             content,
-            payload.localId ?? undefined,
+            localId,
             payload.scheduledAt ?? null
         )
         const actualSessionId = inserted.sessionId

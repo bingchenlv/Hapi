@@ -4,6 +4,7 @@ import { jwtVerify } from 'jose'
 
 export type WebAppEnv = {
     Variables: {
+        requestId: string
         userId: number
         namespace: string
     }

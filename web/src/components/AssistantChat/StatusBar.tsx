@@ -8,7 +8,7 @@ import {
 import type { PermissionModeTone } from '@hapi/protocol'
 import * as Popover from '@radix-ui/react-popover'
 import { useMemo } from 'react'
-import type { AgentState, CodexCollaborationMode, PermissionMode } from '@/types/api'
+import type { AgentState, CodexCollaborationMode, CodexRateLimits, PermissionMode } from '@/types/api'
 import type { ConversationStatus } from '@/realtime/types'
 import { getContextBudgetTokens } from '@/chat/modelConfig'
 import {
@@ -20,6 +20,7 @@ import {
 import { isFastServiceTier } from './codexFastMode'
 import { useTranslation } from '@/lib/use-translation'
 import { useSessionHeaderMetadata } from '@/hooks/useSessionHeaderMetadata'
+import { CodexRateLimitsIndicator } from './CodexRateLimitsIndicator'
 
 // Vibing messages for thinking state
 const VIBING_MESSAGES = [
@@ -199,6 +200,7 @@ export function StatusBar(props: {
     contextSize?: number
     contextCacheRead?: number
     contextWindow?: number | null
+    codexRateLimits?: CodexRateLimits
     /**
      * Model to use for the context-window fallback heuristic when
      * contextWindow is absent. Falls back to `model`. Callers pass the
@@ -361,6 +363,9 @@ export function StatusBar(props: {
                             </Popover.Content>
                         </Popover.Portal>
                     </Popover.Root>
+                ) : null}
+                {props.agentFlavor === 'codex' ? (
+                    <CodexRateLimitsIndicator rateLimits={props.codexRateLimits} />
                 ) : null}
             </div>
 

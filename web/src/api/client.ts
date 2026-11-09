@@ -138,6 +138,7 @@ export class ApiError extends Error {
     status: number
     code?: string
     body?: string
+    requestId?: string
 
     constructor(message: string, status: number, code?: string, body?: string) {
         super(message)
@@ -190,6 +191,8 @@ export class ApiClient {
             headers.set('content-type', 'application/json')
         }
 
+        const requestId = headers.get('x-request-id') ?? crypto.randomUUID()
+        headers.set('x-request-id', requestId)
         const res = await fetch(this.buildUrl(path), {
             ...init,
             headers
@@ -209,12 +212,14 @@ export class ApiClient {
         if (!res.ok) {
             const body = await res.text().catch(() => '')
             const code = parseErrorCode(body)
-            throw new ApiError(
+            const error = new ApiError(
                 `HTTP ${res.status} ${res.statusText}: ${body}`,
                 res.status,
                 code,
                 body || undefined
             )
+            error.requestId = res.headers.get('x-request-id') ?? requestId
+            throw error
         }
 
         return await res.json() as T
@@ -680,6 +685,18 @@ export class ApiClient {
         })
     }
 
+    async setHybridModel(sessionId: string, mode: 'openai' | 'hybrid'): Promise<{ mode: 'openai' | 'hybrid' }> {
+        return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/hybrid-model`, {
+            method: 'POST', body: JSON.stringify({ mode })
+        })
+    }
+
+    async setDeepSeekCollaboration(sessionId: string, mode: 'openai' | 'hybrid'): Promise<{ mode: 'openai' | 'hybrid' }> {
+        return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/deepseek-collaboration`, {
+            method: 'POST', body: JSON.stringify({ mode })
+        })
+    }
+
     async setPermissionMode(sessionId: string, mode: PermissionMode): Promise<void> {
         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/permission-mode`, {
             method: 'POST',
@@ -846,7 +863,8 @@ export class ApiClient {
         serviceTier?: 'fast' | 'standard',
         collaborationMode?: CodexCollaborationMode,
         copilotAgentMode?: CopilotAgentMode,
-        startingMode?: 'remote' | 'pty'
+        startingMode?: 'remote' | 'pty',
+        sourceProjectSessionId?: string
     ): Promise<SpawnResponse> {
         return await this.request<SpawnResponse>(`/api/machines/${encodeURIComponent(machineId)}/spawn`, {
             method: 'POST',
@@ -863,7 +881,8 @@ export class ApiClient {
                 serviceTier,
                 collaborationMode,
                 copilotAgentMode,
-                startingMode
+                startingMode,
+                sourceProjectSessionId
             })
         })
     }

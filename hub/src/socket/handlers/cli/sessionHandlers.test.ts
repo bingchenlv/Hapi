@@ -89,6 +89,22 @@ describe('cli session handlers', () => {
         sync('consumed', 'stale'); sync('consumed', null)
         expect(store.messages.getAllMessages(session.id)[0]).toMatchObject({ content: { content: { text: 'executed' } } })
     })
+    it('keeps one original peer row through native queue mirroring and consumption when the sender supplies a localId', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession('peer-identity', { capabilities: { concurrentClients: true } }, null, 'default')
+        const socket = new FakeSocket()
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store, resolveSessionAccess: () => ({ ok: true, value: session }), emitAccessError() {}
+        })
+        const localId = 'synthetic-peer-local-id'
+        const original = store.messages.addMessage(session.id, { role: 'user', content: { type: 'text', text: 'peer feedback' }, meta: { sentFrom: 'webapp', deliveryMode: 'queue' } }, localId)
+        socket.trigger('native-queue-message', { sid: session.id, localId, text: 'peer feedback' })
+        const queued = store.messages.getAllMessages(session.id)
+        expect(queued).toHaveLength(1); expect(queued[0].id).toBe(original.id)
+        store.messages.markMessagesInvoked(session.id, [localId], 12345)
+        expect(store.messages.getAllMessages(session.id)[0]).toMatchObject({ id: original.id, localId, invokedAt: 12345 })
+        store.close()
+    })
     it('preserves immediate queued rows for cleared handoff transfer', () => {
         const store = new Store(':memory:')
         const session = store.sessions.getOrCreateSession('clear-end', {}, null, 'default')
@@ -488,4 +504,35 @@ describe('cli session handlers', () => {
             supersededBySessionId: 'owned-target', opencodeClearOperation: operation, lifecycleState: 'archived'
         })
     })
+
+    it('replaces the numbered placeholder with the CLI title while retaining numbering and quota', () => {
+        const codexRateLimits = {
+            primary: { usedPercent: 65, windowDurationMins: 300 },
+            secondary: { usedPercent: 95, windowDurationMins: 10_080 },
+            updatedAt: 1_800_000_000_000
+        }
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession('numbered-codex', {
+            path: '/tmp/project', host: 'example', name: 'Codex-03', codexAutoNameSequence: 3
+        }, null, 'default')
+        const socket = new FakeSocket()
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: () => ({ ok: true, value: session as StoredSession }),
+            emitAccessError: () => { throw new Error('unexpected access error') }
+        })
+
+        let ackResponse: unknown = null
+        socket.trigger('update-metadata', {
+            sid: session.id,
+            expectedVersion: session.metadataVersion,
+            metadata: { path: '/tmp/project', host: 'example', name: 'Generated task title', codexRateLimits }
+        }, (response) => { ackResponse = response })
+
+        expect(ackResponse).toMatchObject({
+            result: 'success',
+            metadata: { name: 'Generated task title', codexAutoNameSequence: 3, codexAutoNameTitle: 'Generated task title', codexRateLimits }
+        })
+    })
+
 })

@@ -1,7 +1,8 @@
 import { createContext, useEffect, useState, useCallback, type ReactNode } from 'react'
 import { en, zhCN } from './locales'
+import { resolveLocale, type Locale } from './localePreference'
 
-export type Locale = 'en' | 'zh-CN'
+export type { Locale } from './localePreference'
 
 export type Translations = Record<string, string>
 
@@ -25,13 +26,14 @@ function interpolate(str: string, params?: Record<string, string | number>): str
 
 export function I18nProvider({ children }: { children: ReactNode }) {
   const [locale, setLocaleState] = useState<Locale>(() => {
-    const saved = localStorage.getItem('hapi-lang')
-    return (saved === 'en' || saved === 'zh-CN') ? saved : 'en'
+    let saved: string | null = null
+    try { saved = localStorage.getItem('hapi-lang') } catch { /* Storage may be unavailable in private webviews. */ }
+    return resolveLocale(saved, navigator.languages?.length ? navigator.languages : [navigator.language])
   })
 
   const setLocale = useCallback((newLocale: Locale) => {
     setLocaleState(newLocale)
-    localStorage.setItem('hapi-lang', newLocale)
+    try { localStorage.setItem('hapi-lang', newLocale) } catch { /* The current page can still honor the choice. */ }
     document.documentElement.lang = newLocale
   }, [])
 

@@ -14,6 +14,7 @@ import {
 } from './QueuedMessagesBar'
 import { formatScheduledTime } from '@/lib/scheduledTime'
 import { clearQueuedEditRecovery, getQueuedEditRecovery } from '@/lib/queued-edit-recovery'
+import { clearQueuedDismissals, persistQueuedDismissal } from '@/lib/queued-dismissals'
 
 type DeferredCancelResult = { status: 'cancelled' | 'invoked' | 'busy'; localId?: string }
 
@@ -196,6 +197,51 @@ function installManualAnimationFrames() {
 
 afterEach(() => {
     vi.unstubAllGlobals()
+})
+
+describe('QueuedMessagesBar dismissal cleanup failure', () => {
+    afterEach(() => {
+        vi.restoreAllMocks()
+        clearQueuedDismissals('session-1', ['audit-clear-local'])
+        clearQueuedDismissals('other-clear-session', ['audit-clear-local'])
+    })
+
+    it('shows a persistent alert even with no queued cards and clears it after recovery', async () => {
+        const row = makeQueuedMessage(null, 'audit-clear-server', {
+            localId: 'audit-clear-local', deliveryState: 'indeterminate', invokedAt: null,
+        })
+        persistQueuedDismissal('session-1', row)
+        const view = renderQueuedMessage()
+        const remove = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {
+            throw new Error('audit storage removal denied')
+        })
+        await act(async () => { clearQueuedDismissals('session-1', [row.localId!]) })
+        expect(screen.getByRole('alert')).toHaveTextContent('queuedMessages.dismissClearStorageFailed')
+        mocks.messageWindowState = { messages: [] }
+        view.rerender(null)
+        expect(screen.getByRole('alert')).toBeInTheDocument()
+        expect(screen.queryByRole('list', { name: 'Queued messages' })).not.toBeInTheDocument()
+        expect(mocks.mutateAsync).not.toHaveBeenCalled()
+        remove.mockRestore()
+        await act(async () => { clearQueuedDismissals('session-1', [row.localId!]) })
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+        view.unmount()
+    })
+
+    it('does not show another session storage failure', () => {
+        const row = makeQueuedMessage(null, 'audit-clear-server', {
+            localId: 'audit-clear-local', deliveryState: 'indeterminate', invokedAt: null,
+        })
+        persistQueuedDismissal('other-clear-session', row)
+        const remove = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {
+            throw new Error('audit storage removal denied')
+        })
+        clearQueuedDismissals('other-clear-session', [row.localId!])
+        const view = renderQueuedMessage()
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+        view.unmount()
+        remove.mockRestore()
+    })
 })
 
 describe('QueuedMessagesBar layout', () => {

@@ -90,6 +90,7 @@ export function NewSession(props: {
     onChooseFolder?: (args: { machineId: string | null; directory: string }) => void
     initialDirectory?: string
     initialMachineId?: string
+    initialProjectSessionId?: string
 }) {
     const { haptic } = usePlatform()
     const { t } = useTranslation()
@@ -102,7 +103,28 @@ export function NewSession(props: {
     const [directory, setDirectory] = useState(props.initialDirectory ?? '')
     const [suppressSuggestions, setSuppressSuggestions] = useState(false)
     const [isDirectoryFocused, setIsDirectoryFocused] = useState(false)
-    const [agent, setAgent] = useState<AgentType>(loadPreferredAgent)
+    const [agent, setAgent] = useState<AgentType>(() => {
+        if (props.initialProjectSessionId) {
+            const initialFlavor = sessions.find(session => session.id === props.initialProjectSessionId)?.metadata?.flavor
+            return initialFlavor === 'agy' ? 'agy' : 'codex'
+        }
+        return loadPreferredAgent()
+    })
+    const [projectSourceId, setProjectSourceId] = useState(props.initialProjectSessionId ?? '')
+    const selectedProjectSource = sessions.find(session => session.id === projectSourceId)
+    const projectSources = useMemo(() => {
+        const byProject = new Map<string, typeof sessions[number]>()
+        for (const session of sessions) {
+            const project = session.metadata?.project
+            if (!project || session.metadata?.machineId !== machineId || (session.metadata?.flavor !== 'codex' && session.metadata?.flavor !== 'agy')) continue
+            if (!byProject.has(project.id) || session.id === project.controllerSessionId) byProject.set(project.id, session)
+        }
+        return [...byProject.values()]
+    }, [sessions, machineId])
+    useEffect(() => {
+        const project = selectedProjectSource?.metadata?.project
+        if (project && ((agent !== 'codex' && agent !== 'agy') || selectedProjectSource?.metadata?.machineId !== machineId || directory !== project.directory)) setProjectSourceId('')
+    }, [selectedProjectSource, agent, machineId, directory])
     // Snapshot taken once at mount, before any savePreferredAgent() call this
     // component makes can overwrite the stored agent. savePreferredAgent()
     // runs on every agent change (below), so reading loadPreferredAgent()
@@ -1624,7 +1646,9 @@ export function NewSession(props: {
                 return
             }
 
+            if (projectSourceId && !selectedProjectSource?.metadata?.project) throw new Error(t('newSession.project.unavailable'))
             const result = await spawnSession({
+                sourceProjectSessionId: projectSourceId || undefined,
                 machineId,
                 directory: trimmedDirectory,
                 agent,
@@ -1727,6 +1751,22 @@ export function NewSession(props: {
                 isDisabled={isFormDisabled}
                 onChange={handleMachineChange}
             />
+            {(agent === 'codex' || agent === 'agy') && (projectSources.length > 0 || projectSourceId) ? (
+                <div className="flex items-center gap-3 px-3 py-3">
+                    <label htmlFor="session-project" className="text-sm">{t('newSession.project')}</label>
+                    <select id="session-project" className="min-w-0 flex-1 rounded border border-[var(--app-divider)] bg-transparent p-2 text-sm"
+                        disabled={isFormDisabled}
+                        value={selectedProjectSource?.metadata?.project?.id ?? ''}
+                        onChange={event => {
+                            const source = projectSources.find(session => session.metadata?.project?.id === event.target.value)
+                            setProjectSourceId(source?.id ?? '')
+                            if (source?.metadata?.project) setDirectory(source.metadata.project.directory)
+                        }}>
+                        <option value="">{t('newSession.project.none')}</option>
+                        {projectSources.map(source => <option key={source.metadata!.project!.id} value={source.metadata!.project!.id}>{source.metadata!.project!.name}</option>)}
+                    </select>
+                </div>
+            ) : null}
             {runnerSpawnError ? (
                 <div className="px-3 py-2 text-xs text-red-600">
                     Runner last spawn error: {runnerSpawnError}

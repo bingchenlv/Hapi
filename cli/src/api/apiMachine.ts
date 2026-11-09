@@ -1,3 +1,4 @@
+import { SessionProjectSchema } from '@hapi/protocol'
 /**
  * WebSocket client for machine/runner communication with hapi-hub
  */
@@ -381,7 +382,7 @@ export class ApiMachineClient {
 
     setRPCHandlers({ spawnSession, stopSession, requestShutdown }: MachineRpcHandlers): void {
         this.rpcHandlerManager.registerHandler(RPC_METHODS.SpawnHappySession, async (params: any) => {
-            const { directory, sessionId, existingSessionId, resumeSessionId, machineId, approvedNewDirectoryCreation, agent, model, effort, modelReasoningEffort, yolo, permissionMode, serviceTier, collaborationMode, copilotAgentMode, token, sessionType, worktreeName, startingMode, forkSession } = params || {}
+            const { directory, sessionId, existingSessionId, resumeSessionId, machineId, approvedNewDirectoryCreation, agent, model, effort, modelReasoningEffort, yolo, permissionMode, serviceTier, collaborationMode, copilotAgentMode, token, sessionType, worktreeName, startingMode, forkSession, sessionProject } = params || {}
 
             if (!directory) {
                 throw new Error('Directory is required')
@@ -397,6 +398,7 @@ export class ApiMachineClient {
             }
 
             const result = await spawnSession({
+                requestId: typeof params?.requestId === 'string' && /^[a-f0-9-]{36}$/i.test(params.requestId) ? params.requestId : undefined,
                 directory,
                 sessionId,
                 existingSessionId,
@@ -416,6 +418,7 @@ export class ApiMachineClient {
                 sessionType,
                 worktreeName,
                 startingMode,
+                sessionProject: sessionProject === undefined ? undefined : SessionProjectSchema.parse(sessionProject),
                 forkSession: forkSession === true,
                 validateDirectory: async (path) => await this.pathPolicy.allowsSpawn(path),
             })

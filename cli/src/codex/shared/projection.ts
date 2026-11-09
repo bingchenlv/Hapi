@@ -43,11 +43,18 @@ export class SharedCodexProjection {
     }
 
     turnFor(id: string): string | undefined { return this.turns.get(id); }
+    private originThread(turnId?: string): string {
+        return !this.parentThreadId && turnId
+            ? this.session.getMetadata()?.codexProviderHistory?.turnOrigins?.[turnId] ?? this.threadId
+            : this.threadId;
+    }
     reset(): void { this.converter = new AppServerEventConverter(); this.emitted.clear(); }
-    private send(body: Record<string, unknown>, key: string): void {
+    private send(body: Record<string, unknown>, key: string, turnId = key.split(':')[0]): void {
         if (this.emitted.has(key)) return;
         this.emitted.add(key);
-        const id = `codex:${this.threadId}:${key}`;
+        // Forks replay notifications as well as snapshots. Native execution
+        // changes, but an inherited event keeps its original durable Hub ID.
+        const id = `codex:${this.originThread(turnId)}:${key}`;
         this.session.sendAgentMessage(this.parentThreadId && !String(body.type).startsWith('agent-run-') ? {
             type: 'agent-run-trace', agentId: this.threadId, cardId: `codex-agent:${this.threadId}`, message: { ...body, id }, id,
             scope: { role: 'child', threadId: this.threadId, parentThreadId: this.parentThreadId }, scope_role: 'child'
@@ -57,7 +64,8 @@ export class SharedCodexProjection {
     async notification(method: string, params: unknown, modelAtReceipt?: string): Promise<void> {
         const p = record(params);
         const item = record(p.item);
-        if (!this.parentThreadId && p.threadId === this.threadId && string(item.id)) {
+        if (!this.parentThreadId && p.threadId === this.threadId && string(item.id)
+            && this.originThread(string(p.turnId)) === this.threadId) {
             const key = `${string(p.turnId) ?? 'thread'}:${item.id}`;
             if (!this.completedTitles.has(key)) {
                 const title = requestedTitle(item);
@@ -93,13 +101,13 @@ export class SharedCodexProjection {
         }
         const itemId = string(item.id) ?? string(p.itemId);
         if (!this.parentThreadId && (method === 'item/started' || method === 'item/completed') && item.type === 'userMessage') {
-            const id = string(item.clientId ?? item.clientUserMessageId) ?? (itemId ? `codex:${this.threadId}:user:${itemId}` : undefined);
+            const id = string(item.clientId ?? item.clientUserMessageId) ?? (itemId ? `codex:${this.originThread(turnId)}:user:${itemId}` : undefined);
             if (id) {
                 const firstInTurn = turnId ? [...this.turns].find(([, value]) => value === turnId)?.[0] : undefined;
                 if (turnId) this.turns.set(id, turnId);
                 await this.committed(id);
                 const text = inputText(item.content);
-                if (text) this.session.sendUserMessage(text, undefined, id);
+                if (text && !id.startsWith('hapi:minimax-fallback:')) this.session.sendUserMessage(text, undefined, id);
                 this.session.updateMetadata(metadata => ({ ...metadata, conversationHistoryTurns: Object.fromEntries(this.turns),
                     ...(turnId && (!firstInTurn || firstInTurn === id) ? { conversationHistoryPoints: { ...metadata.conversationHistoryPoints, [id]: true } } : {})
                 }));
@@ -138,7 +146,7 @@ export class SharedCodexProjection {
                 const model = event.type === 'token_count' && turnId ? this.turnModels.get(turnId) : undefined;
                 this.send({ ...event, ...(model ? { model } : {}), flavor: 'codex', scope: { role: 'parent', threadId: this.threadId }, scope_role: 'parent', thread_id: this.threadId }, key);
             } else if (event.type === 'proposed_plan' && turnId && itemId) {
-                const planId = codexPlanProposalId(this.threadId, turnId, itemId);
+                const planId = codexPlanProposalId(this.originThread(turnId), turnId, itemId);
                 this.send({ type: 'tool-call', name: 'ExitPlanMode', callId: planId, input: { plan: event.plan } }, key);
                 // A proposal is durable content, not a native approval request.
                 this.send({ type: 'tool-call-result', callId: planId, output: null }, `${key}:result`);
@@ -146,7 +154,7 @@ export class SharedCodexProjection {
                 this.send({ type: 'tool-call', name: 'update_plan', callId: 'codex-plan-state', input: { plan: event.plan, source: 'codex' } }, key);
                 this.send({ type: 'tool-call-result', callId: 'codex-plan-state', output: { plan: event.plan, source: 'codex', status: 'updated' } }, `${key}:result`);
             } else if (event.type === 'generated_image' && typeof event.saved_path === 'string') {
-                const image = await registerGeneratedImageFromPath({ path: event.saved_path, id: createHash('sha256').update(`${this.threadId}:${key}`).digest('hex'), fileName: string(event.file_name) });
+                const image = await registerGeneratedImageFromPath({ path: event.saved_path, id: createHash('sha256').update(`${this.originThread(turnId)}:${key}`).digest('hex'), fileName: string(event.file_name) });
                 if (image) this.send({ type: 'generated-image', imageId: image.id, fileName: image.fileName, mimeType: image.mimeType }, key);
             } else if (event.type === 'task_failed') {
                 this.send({ type: 'message', message: `Codex error: ${event.error ?? event.message ?? 'Turn failed'}` }, key);
@@ -159,7 +167,7 @@ export class SharedCodexProjection {
                 this.send({ type: 'agent-run-update', agentId, cardId: `codex-agent:${agentId}`,
                     status: status === 'completed' ? 'completed' : status === 'errored' ? 'failed' : 'running',
                     summary: record(state).message, input: item, scope: { role: 'child', threadId: agentId, parentThreadId: this.threadId }, scope_role: 'child', thread_id: agentId
-                }, `agent:${agentId}:${itemId}:${method}:${JSON.stringify(state)}`);
+                }, `agent:${agentId}:${itemId}:${method}:${JSON.stringify(state)}`, turnId);
             }
         }
     }
@@ -171,6 +179,11 @@ export class SharedCodexProjection {
         let latestTitle: string | undefined;
         for (const value of turns) {
             const turn = record(value);
+            // Provider migration forks native history into the same HAPI chat.
+            // These turns were flushed before the fork and already exist in
+            // the hub under their original stable IDs; never emit them twice.
+            if (!this.parentThreadId && typeof turn.id === 'string'
+                && this.session.getMetadata()?.codexProviderHistory?.inheritedTurnIds.includes(turn.id)) continue;
             if (!Array.isArray(turn.items)) continue;
             for (const item of turn.items) {
                 const params = { threadId: this.threadId, turnId: turn.id, item };

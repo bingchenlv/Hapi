@@ -96,6 +96,11 @@ function toStoredMessage(row: DbMessageRow): StoredMessage {
     }
 }
 
+export function getMessageById(db: Database, sessionId: string, messageId: string): StoredMessage | null {
+    const row = db.prepare('SELECT * FROM messages WHERE session_id=? AND id=?').get(sessionId, messageId) as DbMessageRow | undefined
+    return row ? toStoredMessage(row) : null
+}
+
 export type CopyStoredMessageInput = Pick<
     StoredMessage,
     'content' | 'createdAt' | 'localId' | 'invokedAt' | 'scheduledAt' | 'deliveryState'
@@ -109,6 +114,9 @@ export function addMessage(
     scheduledAt?: number | null,
     createdAt?: number
 ): StoredMessage {
+    if (localId && db.prepare('SELECT 1 FROM maintenance_message_request WHERE request_key=?').get(localId)) {
+        throw new Error('Maintenance message identity is reserved; use controller reconciliation')
+    }
     const now = Date.now()
     // Client-provided origin timestamp (e.g. a Claude transcript entry's own
     // `timestamp`), falling back to server-receive time when absent. Only
@@ -181,6 +189,16 @@ export function addMessage(
 /** Shared engines own pending native text. Never overwrite an invoked row. */
 export function syncNativeQueuedMessage(db: Database, sessionId: string, localId: string, text: string): StoredMessage {
     return db.transaction(() => {
+        const reserved = db.prepare('SELECT session_id,message_id FROM maintenance_message_request WHERE request_key=?')
+            .get(localId) as { session_id: string; message_id: string } | undefined
+        if (reserved) {
+            const message = getMessageById(db, sessionId, reserved.message_id)
+            const parsed = z.object({ content: z.object({ text: z.string() }) }).safeParse(message?.content)
+            if (reserved.session_id !== sessionId || !message || !parsed.success || parsed.data.content.text !== text) {
+                throw new Error('Maintenance message content is immutable; use controller reconciliation')
+            }
+            return message
+        }
         const initial = { role: 'user', content: { type: 'text', text }, meta: { sentFrom: 'cli', isNativeQueuedMessage: true } }
         const message = addMessage(db, sessionId, initial, localId)
         if (message.invokedAt !== null) return message

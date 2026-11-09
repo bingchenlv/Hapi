@@ -1,4 +1,20 @@
 export default {
+  'hybrid.standalone': '协作暂停 · 切回恢复',
+  'hybrid.routePending': '协作暂不可用',
+  'hybrid.on': '协作开启',
+  'hybrid.off': '协作关闭',
+  'hybrid.pending': '切换中…',
+  'hybrid.help': '只影响本会话。开启后允许 MiniMax 协作，并在 Codex 用量耗尽时自动接管。关闭后仍可手动选择 MiniMax；已受理的协作请求可能完成。',
+    'hybrid.helpBoth': 'MiniMax 与 DeepSeek 分别控制，仅对本会话生效。OpenAI 主控按任务分工；关闭后不再发送新请求，已受理请求可以完成。',
+  'modelRouting.standalone': 'MiniMax 独立运行',
+  'modelRouting.deepseek': 'DeepSeek 独立运行',
+  'modelRouting.approvals': '需审批的操作请在前端确认',
+  'modelRouting.takeover': 'Codex 额度耗尽 · MiniMax 已接管',
+  'modelRouting.switching': '正在切换模型供应商…',
+  'modelRouting.failed': '模型接管未完成，请检查模型与消息队列',
+  'modelRouting.upgrade': 'MiniMax 独立与自动接管：等待会话更新',
+  'hybrid.unavailable': 'MiniMax 开关：用新版运行时重新打开会话后可用',
+  'hybrid.unconfirmed': '切换尚未得到确认',
   // Loading states
   'loading': '加载中…',
   'authorizing': '认证中…',
@@ -297,6 +313,7 @@ export default {
   'dialog.archive.confirming': '归档中…',
 
   'dialog.reopen.errorTitle': '无法重新打开会话',
+  'dialog.reopen.resourceBusy': '服务器资源暂时繁忙，保护机制已阻止启动。请等待已有任务释放资源后再尝试；未自动重试，历史记录保留。',
   'dialog.reopen.dismiss': '关闭',
 
   'dialog.delete.title': '删除会话',
@@ -343,6 +360,12 @@ export default {
   'button.paste': '粘贴',
 
   // New session form
+  "newSession.project": "项目",
+  "newSession.project.none": "独立会话",
+  "newSession.project.unavailable": "项目会话暂不可用，请重新选择项目。",
+  "sessions.project.controller": "总控",
+  "sessions.project.research": "研究",
+  "sessions.project.development": "开发",
   'newSession.title': '创建会话',
   'newSession.machine': '机器',
   'newSession.directory': '目录',
@@ -670,6 +693,8 @@ export default {
   'queuedMessages.steer': '立即插入当前回合',
   'queuedMessages.steerFailed': '插入失败，消息仍在队列中',
   'queuedMessages.steerOutcomeUnknown': '发送结果未知，请明确重试或取消',
+  'queuedMessages.dismissStorageFailed': '无法保存移除状态，消息卡片已保留，请检查浏览器存储设置',
+  'queuedMessages.dismissClearStorageFailed': '无法保存隐藏标记的清除结果；本页不会沿用旧标记隐藏消息。请检查浏览器存储设置，刷新后旧标记可能再次生效。',
   'queuedMessages.retryOutcome': '重试不确定的消息发送',
   'queuedMessages.retryFailed': '重试失败',
   'queuedMessages.retryMissing': '消息已不存在',
@@ -1141,6 +1166,13 @@ export default {
   'misc.contextUsed': '使用：{value}（{percent}%）',
   'misc.contextUsedTokens': '使用：{value}',
   'misc.contextRemaining': '剩余：{value}（{percent}%）',
+  'misc.codexLimitsDetails': 'Codex 用量限额',
+  'misc.codexLimits': 'Codex 用量限额',
+  'misc.codexLimitUsage': '{window} 用量：{percent}',
+  'misc.codexLimitUsed': '已使用 {percent}',
+  'misc.codexLimitResetsIn': '{value} 后重置',
+  'misc.codexLimitRefreshPending': '已到重置时间 · 等待实时刷新',
+  'misc.codexLimitUpdated': '更新于{value}',
 
   // Web Share Target 分享面板
   'share.title': '分享到 HAPI',

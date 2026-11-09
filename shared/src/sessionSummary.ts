@@ -1,4 +1,5 @@
 import type { AgentState, Metadata, Session, TodoItem, WorktreeMetadata } from './schemas'
+import type { SessionProject } from './sessionProject'
 import { isKnownFlavor } from './flavors'
 import type { AgentFlavor } from './modes'
 
@@ -33,6 +34,7 @@ function classifyKind(tool: string): PendingRequestKind {
 }
 
 export type SessionSummaryMetadata = {
+    project?: SessionProject
     name?: string
     path: string
     machineId?: string
@@ -191,6 +193,7 @@ export function toSessionSummaryMetadata(metadata: Metadata | null | undefined):
         return null
     }
     return {
+        project: metadata.project,
         name: metadata.name,
         path: metadata.path,
         machineId: metadata.machineId ?? undefined,

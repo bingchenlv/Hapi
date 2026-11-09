@@ -1,3 +1,4 @@
+import { SetSessionProjectRequestSchema } from '@hapi/protocol'
 import {
     CursorMigrateToAcpRequestSchema,
     DeleteUploadRequestSchema,
@@ -70,6 +71,22 @@ function estimateBase64Bytes(base64: string): number {
 
 export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Hono<WebAppEnv> {
     const app = new Hono<WebAppEnv>()
+
+    app.put('/sessions/:id/project', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+        const target = requireSessionFromParam(c, engine)
+        if (target instanceof Response) return target
+        const parsed = SetSessionProjectRequestSchema.safeParse(await c.req.json().catch(() => null))
+        if (!parsed.success) return c.json({ error: 'Invalid project binding' }, 400)
+        try {
+            engine.setSessionProject(target.sessionId, c.get('namespace'), parsed.data.project, parsed.data.expectedMetadataVersion)
+            return c.json({ ok: true })
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to save project binding'
+            return c.json({ error: message }, message.includes('concurrently') ? 409 : 400)
+        }
+    })
 
     app.get('/sessions', (c) => {
         const engine = requireSyncEngine(c, getSyncEngine)
@@ -233,10 +250,10 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         const result = await engine.resumeSession(
             sessionResult.sessionId,
             namespace,
-            permissionMode !== undefined ? { permissionMode } : undefined
+            { ...(permissionMode !== undefined ? { permissionMode } : {}), ...(c.get('requestId') ? { requestId: c.get('requestId') } : {}) }
         )
         if (result.type === 'error') {
-            const status = result.code === 'no_machine_online' ? 503
+            const status = result.code === 'no_machine_online' || result.code === 'resource_busy' ? 503
                 : result.code === 'access_denied' ? 403
                     : result.code === 'session_not_found' ? 404
                         : result.code === 'resume_unavailable' ? 409
@@ -259,14 +276,15 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         }
 
         const namespace = c.get('namespace')
-        const result = await engine.reopenSession(sessionResult.sessionId, namespace)
+        const result = await engine.reopenSession(sessionResult.sessionId, namespace,
+            c.get('requestId') ? { requestId: c.get('requestId') } : undefined)
 
         if (result.type === 'incomplete') {
             return c.json({ error: result.message, missing: result.missing }, 422)
         }
 
         if (result.type === 'error') {
-            const status = result.code === 'no_machine_online' ? 503
+            const status = result.code === 'no_machine_online' || result.code === 'resource_busy' ? 503
                 : result.code === 'access_denied' ? 403
                     : result.code === 'session_not_found' ? 404
                         : result.code === 'resume_unavailable' ? 409
@@ -566,6 +584,45 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         if (sessionResult.session.metadata?.capabilities?.concurrentClients) return c.json({ error: 'Shared sessions do not switch modes', code: 'control_mode_not_applicable' }, 409)
         await engine.switchSession(sessionResult.sessionId, 'remote')
         return c.json({ ok: true })
+    })
+
+    app.post('/sessions/:id/hybrid-model', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+        const result = requireSessionFromParam(c, engine, { requireActive: true })
+        if (result instanceof Response) return result
+        if (result.session.metadata?.flavor !== 'codex' || !result.session.metadata.hybridModel) {
+            return c.json({ error: 'Resume this session with the updated runtime to use the hybrid switch' }, 409)
+        }
+        const body = await c.req.json().catch(() => null)
+        if (!body || Object.keys(body).length !== 1 || !['openai', 'hybrid'].includes(body.mode)) {
+            return c.json({ error: 'Invalid body' }, 400)
+        }
+        try {
+            return c.json(await engine.hybridModel(result.sessionId, body.mode))
+        } catch (error) {
+            return c.json({ error: error instanceof Error ? error.message : 'Hybrid model setting failed' }, 409)
+        }
+    })
+
+    app.post('/sessions/:id/deepseek-collaboration', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+        const result = requireSessionFromParam(c, engine, { requireActive: true })
+        if (result instanceof Response) return result
+        if (result.session.metadata?.flavor !== 'codex' || !result.session.metadata.deepseekCollaboration
+            || result.session.metadata.capabilities?.deepseekCollaboration !== true) {
+            return c.json({ error: 'Resume this session with the updated runtime to use the DeepSeek collaboration switch' }, 409)
+        }
+        const body = await c.req.json().catch(() => null)
+        if (!body || Object.keys(body).length !== 1 || !['openai', 'hybrid'].includes(body.mode)) {
+            return c.json({ error: 'Invalid body' }, 400)
+        }
+        try {
+            return c.json(await engine.deepseekCollaboration(result.sessionId, body.mode))
+        } catch (error) {
+            return c.json({ error: error instanceof Error ? error.message : 'DeepSeek collaboration setting failed' }, 409)
+        }
     })
 
     app.post('/sessions/:id/permission-mode', async (c) => {

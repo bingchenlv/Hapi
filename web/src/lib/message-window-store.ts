@@ -3,6 +3,7 @@ import type { ApiClient } from '@/api/client'
 import { normalizeDecryptedMessage } from '@/chat/normalize'
 import type { DecryptedMessage, MessageStatus, MessagesResponse } from '@/types/api'
 import { isQueuedForInvocation, mergeMessages } from '@/lib/messages'
+import { clearQueuedDismissals, restoreQueuedDismissals } from '@/lib/queued-dismissals'
 
 export type MessageViewMode = 'tail' | 'history'
 
@@ -408,7 +409,9 @@ function buildState(
         | 'tailRevision'
     >>
 ): InternalState {
-    const messages = updates.messages ?? previous.messages
+    const messages = updates.messages
+        ? restoreQueuedDismissals(previous.sessionId, updates.messages)
+        : previous.messages
     const bounds = deriveSeqBounds(messages)
     return {
         ...previous,
@@ -1189,7 +1192,8 @@ export function seedMessageWindowFromSession(fromSessionId: string, toSessionId:
     const source = getState(fromSessionId)
     const target = getState(toSessionId)
     const seeded = buildState(createState(toSessionId), {
-        messages: [...source.messages],
+        // Dismissal is a per-session UI choice, not inherited conversation data.
+        messages: source.messages.map(({ queueDismissed: _dismissed, ...message }) => message),
         hasMore: source.hasMore,
         tailRevision: source.tailRevision,
         oldestPositionAt: source.oldestPositionAt,
@@ -1289,6 +1293,7 @@ export function markMessagesIndeterminate(sessionId: string, localIds: string[])
 
 export function markMessagesRequeued(sessionId: string, localIds: string[]): void {
     if (localIds.length === 0) return
+    clearQueuedDismissals(sessionId, localIds)
     const idSet = new Set(localIds)
     updateState(sessionId, (previous) => {
         let changed = false
@@ -1319,6 +1324,7 @@ export function markMessagesConsumed(
     steered?: boolean
 ): void {
     if (localIds.length === 0) return
+    clearQueuedDismissals(sessionId, localIds)
     const idSet = new Set(localIds)
     updateState(sessionId, (previous) => {
         let changed = false

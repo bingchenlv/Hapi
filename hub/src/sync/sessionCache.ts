@@ -5,6 +5,7 @@ import { clampAliveTime } from './aliveTime'
 import { EventPublisher } from './eventPublisher'
 import { extractTodoWriteTodosFromMessageContent, TodosSchema } from './todos'
 import { extractBackgroundTaskDelta } from './backgroundTasks'
+import { syncCodexAutoName } from './codexAutoName'
 
 const QUEUED_MESSAGE_THINKING_GRACE_MS = 15_000
 // tiann/hapi#919: metadata writers (renameSession, clearSessionArchiveMetadata,
@@ -136,6 +137,19 @@ export class SessionCache {
         }
 
         const existing = this.sessions.get(sessionId)
+
+        if (stored.metadata && typeof stored.metadata === 'object' && !Array.isArray(stored.metadata)) {
+            const currentMetadata = stored.metadata as Record<string, unknown>
+            const nextMetadata = syncCodexAutoName(currentMetadata, currentMetadata)
+            if (nextMetadata.name !== currentMetadata.name
+                || nextMetadata.codexAutoNameSequence !== currentMetadata.codexAutoNameSequence
+                || nextMetadata.codexAutoNameTitle !== currentMetadata.codexAutoNameTitle) {
+                this.store.sessions.updateSessionMetadata(
+                    sessionId, nextMetadata, stored.metadataVersion, stored.namespace, { touchUpdatedAt: false }
+                )
+                stored = this.store.sessions.getSession(sessionId) ?? stored
+            }
+        }
 
         if (stored.todos === null && !this.todoBackfillAttemptedSessionIds.has(sessionId)) {
             this.todoBackfillAttemptedSessionIds.add(sessionId)
@@ -848,6 +862,7 @@ export class SessionCache {
 
             const currentMetadata = session.metadata ?? { path: '', host: '' }
             const newMetadata = { ...currentMetadata, name }
+            delete newMetadata.codexAutoNameTitle
 
             const result = this.store.sessions.updateSessionMetadata(
                 sessionId,
@@ -872,10 +887,7 @@ export class SessionCache {
         throw new Error('Session was modified concurrently. Please try again.')
     }
 
-    async updateSessionSummary(sessionId: string, text: string): Promise<void> {
-        // Keep the generated/native title separate from metadata.name. A
-        // manually chosen name must continue to win in the Web title helper,
-        // while the summary remains available as the agent-authored fallback.
+    async assignCodexAutoName(sessionId: string, sequence: number, name: string): Promise<void> {
         for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
             const session = this.sessions.get(sessionId) ?? this.refreshSession(sessionId)
             if (!session) {
@@ -883,13 +895,51 @@ export class SessionCache {
             }
 
             const currentMetadata = session.metadata ?? { path: '', host: '' }
-            const newMetadata = {
+            const earlyTitle = currentMetadata.name?.trim()
+            const hasEarlyTitle = Boolean(earlyTitle && !/^Codex-\d+$/.test(earlyTitle))
+            const numberedMetadata = {
+                ...currentMetadata,
+                name: hasEarlyTitle ? earlyTitle : name,
+                codexAutoNameSequence: sequence,
+                codexAutoNameTitle: hasEarlyTitle ? earlyTitle : currentMetadata.codexAutoNameTitle
+            }
+            const newMetadata = syncCodexAutoName(numberedMetadata, numberedMetadata)
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                newMetadata,
+                session.metadataVersion,
+                session.namespace,
+                { touchUpdatedAt: false }
+            )
+
+            if (result.result === 'error') {
+                throw new Error('Failed to assign Codex session name')
+            }
+            if (result.result === 'success') {
+                this.refreshSession(sessionId)
+                return
+            }
+            this.refreshSession(sessionId)
+        }
+
+        throw new Error('Session was modified concurrently while assigning its Codex name')
+    }
+
+    async updateSessionSummary(sessionId: string, text: string): Promise<void> {
+        for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
+            const session = this.sessions.get(sessionId) ?? this.refreshSession(sessionId)
+            if (!session) {
+                throw new Error('Session not found')
+            }
+
+            const currentMetadata = session.metadata ?? { path: '', host: '' }
+            const newMetadata = syncCodexAutoName({
                 ...currentMetadata,
                 summary: {
                     text,
                     updatedAt: Date.now()
                 }
-            }
+            }, currentMetadata)
 
             const result = this.store.sessions.updateSessionMetadata(
                 sessionId,

@@ -1,3 +1,4 @@
+import { SetSessionProjectRequestSchema } from '@hapi/protocol'
 import { Hono } from 'hono'
 import { z } from 'zod'
 import {
@@ -236,6 +237,23 @@ export function createCliRoutes(getSyncEngine: () => SyncEngine | null): Hono<Cl
         const result = engine.confirmOpenCodeClearCleanup(c.req.param('id'), c.get('namespace'), parsed.data.replacementSessionId)
         if (result.type === 'error') return c.json({ error: result.message, code: result.code }, clearErrorStatus(result.code))
         return c.json({ ok: true, sessionId: result.sessionId })
+    })
+
+    app.put('/sessions/:id/project', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) return c.json({ error: 'Not ready' }, 503)
+        const namespace = c.get('namespace')
+        const target = resolveSessionForNamespace(engine, c.req.param('id'), namespace)
+        if (!target.ok) return c.json({ error: target.error }, target.status)
+        const parsed = SetSessionProjectRequestSchema.safeParse(await c.req.json().catch(() => null))
+        if (!parsed.success) return c.json({ error: 'Invalid project binding' }, 400)
+        try {
+            engine.setSessionProject(target.sessionId, namespace, parsed.data.project, parsed.data.expectedMetadataVersion)
+            return c.json({ ok: true })
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to save project binding'
+            return c.json({ error: message }, message.includes('concurrently') ? 409 : 400)
+        }
     })
 
     app.get('/sessions/:id', async (c) => {

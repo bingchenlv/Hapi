@@ -1,11 +1,40 @@
 import { Hono } from 'hono'
-import { MessagesQuerySchema, QueuedStateRequestSchema, SendMessageRequestSchema } from '@hapi/protocol'
+import { MessagesQuerySchema, QueuedStateRequestSchema, SendMessageRequestSchema, MaintenanceMessageRequestSchema } from '@hapi/protocol'
+import { MaintenanceIdentityError } from '../../store/maintenanceMessages'
 import type { SyncEngine } from '../../sync/syncEngine'
 import type { WebAppEnv } from '../middleware/auth'
 import { requireSessionFromParam, requireSyncEngine } from './guards'
 
 export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null): Hono<WebAppEnv> {
     const app = new Hono<WebAppEnv>()
+
+    app.get('/sessions/:id/maintenance/requests/:requestKey', (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+        const binding = requireSessionFromParam(c, engine)
+        if (binding instanceof Response) return binding
+        if (binding.sessionId !== c.req.param('id')) return c.json({ error: 'Exact session binding required' }, 409)
+        const result = engine.getMaintenanceMessageReceipt(binding.sessionId, c.req.param('requestKey'))
+        return result ? c.json(result) : c.json({ error: 'Request not found; delivery remains unknown' }, 404)
+    })
+
+    app.post('/sessions/:id/maintenance/messages', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+        const binding = requireSessionFromParam(c, engine, { requireActive: true })
+        if (binding instanceof Response) return binding
+        if (binding.sessionId !== c.req.param('id') || binding.session.metadata?.flavor !== 'codex') {
+            return c.json({ error: 'Exact Codex session binding required' }, 409)
+        }
+        const parsed = MaintenanceMessageRequestSchema.safeParse(await c.req.json().catch(() => null))
+        if (!parsed.success) return c.json({ error: 'Invalid maintenance request' }, 400)
+        try {
+            return c.json(engine.sendMaintenanceMessage(binding.sessionId, parsed.data))
+        } catch (error) {
+            if (error instanceof MaintenanceIdentityError) return c.json({ error: 'Maintenance request identity conflict' }, 409)
+            throw error
+        }
+    })
 
     app.get('/sessions/:id/messages', async (c) => {
         const engine = requireSyncEngine(c, getSyncEngine)

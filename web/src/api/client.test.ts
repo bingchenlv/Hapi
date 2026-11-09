@@ -2,6 +2,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiClient, ApiError } from './client'
 
 describe('ApiClient error mapping', () => {
+    it('retains correlation on a busy refusal without replaying the POST', async () => {
+        const id = 'aaaaaaaa-1111-4222-8333-444444444444'
+        const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 'resource_busy', error: 'busy' }),
+            { status: 503, headers: { 'x-request-id': id } }))
+        vi.stubGlobal('fetch', fetch)
+        try {
+            await expect(new ApiClient('test').reopenSession('local')).rejects.toMatchObject({ status: 503, code: 'resource_busy', requestId: id })
+            expect(fetch).toHaveBeenCalledTimes(1)
+        } finally { vi.unstubAllGlobals() }
+    })
     let originalFetch: typeof globalThis.fetch
     let fetchMock: ReturnType<typeof vi.fn>
 

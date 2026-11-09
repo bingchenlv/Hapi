@@ -84,3 +84,14 @@ describe('getCodexComposerReasoningEffortOptions', () => {
         ])
     })
 })
+
+ it('excludes unsupported stale MiniMax effort', () => {
+    const options = getCodexComposerReasoningEffortOptions('ultra', 'codex',
+        ['low', 'medium', 'high', 'xhigh', 'max'].map(value => ({ value })), true);
+    expect(options.map(o => o.value)).toEqual([null, 'low', 'medium', 'high', 'xhigh', 'max']);
+ });
+
+ it('does not invent model levels while the strict catalogue is unavailable', () => {
+    expect(getCodexComposerReasoningEffortOptions('ultra', 'codex', undefined, true))
+        .toEqual([{ value: null, label: 'Default' }]);
+ });

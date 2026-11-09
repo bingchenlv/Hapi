@@ -1,9 +1,12 @@
-import type { AgentFlavor } from '@hapi/protocol'
+import type { AgentFlavor, SessionProject } from '@hapi/protocol'
 import type { CopilotAgentMode } from '@hapi/protocol'
 
 export interface SpawnSessionOptions {
+    /** Correlation only; never a session identity or deduplication key. */
+    requestId?: string
     machineId?: string
     directory: string
+    sessionProject?: SessionProject
     sessionId?: string
     // Existing hub session id to reuse (reopen/resume). Distinct from the legacy
     // `sessionId` field above (reserved/unused by spawn): when set, the CLI boots
@@ -37,6 +40,6 @@ export type SpawnSessionResult =
     | {
         type: 'error'
         errorMessage: string
-        code?: 'agent_unavailable' | 'outside_workspace_roots'
+        code?: 'agent_unavailable' | 'outside_workspace_roots' | 'resource_busy'
         agent?: AgentFlavor
     }

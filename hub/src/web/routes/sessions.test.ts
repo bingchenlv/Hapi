@@ -1677,4 +1677,87 @@ describe('sessions routes', () => {
         expect(body.sessions.map((s) => s.id)).toEqual(['new-inactive'])
     })
 
+    // Resource-guard rejection (runner exit code 75 plus a `[HAPI resource
+    // guard]` marker on stderr) is transient. It has to surface as 503 instead
+    // of the generic 500, and it must not change the status of any other
+    // error code.
+    describe('resource-guard rejection (resource_busy)', () => {
+        const guardMessage = 'Session process exited before webhook for PID 42 (exit code 75). stderr: [HAPI resource guard] concurrent session limit reached'
+
+        it('returns 503 for a resume that was rejected by the resource guard', async () => {
+            const session = createSession()
+            const { app } = createApp(session, {
+                resumeSession: async () => ({
+                    type: 'error',
+                    message: guardMessage,
+                    code: 'resource_busy'
+                })
+            })
+
+            const response = await app.request('/api/sessions/session-1/resume', { method: 'POST' })
+
+            expect(response.status).toBe(503)
+            expect(await response.json()).toEqual({ error: guardMessage, code: 'resource_busy' })
+        })
+
+        it('returns 503 for a reopen that was rejected by the resource guard', async () => {
+            const session = createSession()
+            const { app } = createApp(session, {
+                reopenSession: async () => ({
+                    type: 'error',
+                    message: guardMessage,
+                    code: 'resource_busy'
+                })
+            })
+
+            const response = await app.request('/api/sessions/session-1/reopen', { method: 'POST' })
+
+            expect(response.status).toBe(503)
+            expect(await response.json()).toEqual({ error: guardMessage, code: 'resource_busy' })
+        })
+
+        it('keeps the status of every other resume code', async () => {
+            const cases: Array<[string, number]> = [
+                ['access_denied', 403],
+                ['session_not_found', 404],
+                ['resume_unavailable', 409],
+                ['no_machine_online', 503],
+                ['resume_failed', 500],
+                ['some_unknown_code', 500]
+            ]
+
+            for (const [code, status] of cases) {
+                const { app } = createApp(createSession(), {
+                    resumeSession: async () => ({ type: 'error', message: 'boom', code })
+                })
+
+                const response = await app.request('/api/sessions/session-1/resume', { method: 'POST' })
+
+                expect(response.status).toBe(status)
+            }
+        })
+
+        it('keeps the status of every other reopen code', async () => {
+            const cases: Array<[string, number]> = [
+                ['access_denied', 403],
+                ['session_not_found', 404],
+                ['resume_unavailable', 409],
+                ['metadata_conflict', 409],
+                ['no_machine_online', 503],
+                ['resume_failed', 500],
+                ['some_unknown_code', 500]
+            ]
+
+            for (const [code, status] of cases) {
+                const { app } = createApp(createSession(), {
+                    reopenSession: async () => ({ type: 'error', message: 'boom', code })
+                })
+
+                const response = await app.request('/api/sessions/session-1/reopen', { method: 'POST' })
+
+                expect(response.status).toBe(status)
+            }
+        })
+    })
+
 })

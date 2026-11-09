@@ -10,6 +10,7 @@ import { extractTodoWriteTodosFromMessageContent } from '../../../sync/todos'
 import { extractTeamStateFromMessageContent, applyTeamStateDelta } from '../../../sync/teams'
 import { extractBackgroundTaskDelta } from '../../../sync/backgroundTasks'
 import { shouldRecordSessionActivity } from '../../../sync/sessionActivity'
+import { syncCodexAutoName } from '../../../sync/codexAutoName'
 import type { CliSocketWithData } from '../../socketTypes'
 import type { SessionEndReason } from '@hapi/protocol'
 import type { AccessErrorReason, AccessResult } from './types'
@@ -68,7 +69,7 @@ const updateStateSchema = z.object({
     agentState: z.unknown().nullable()
 })
 
-const HUB_OWNED_METADATA_KEYS = ['supersededBySessionId', 'opencodeClearOperation'] as const
+const HUB_OWNED_METADATA_KEYS = ['supersededBySessionId', 'opencodeClearOperation', 'codexAutoNameSequence', 'codexAutoNameTitle'] as const
 
 function preserveHubOwnedMetadata(incoming: unknown, current: unknown): unknown {
     if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return incoming
@@ -80,7 +81,7 @@ function preserveHubOwnedMetadata(incoming: unknown, current: unknown): unknown 
         if (Object.prototype.hasOwnProperty.call(existing, key)) next[key] = existing[key]
         else delete next[key]
     }
-    return next
+    return syncCodexAutoName(next, existing)
 }
 
 export type SessionHandlersDeps = {

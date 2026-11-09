@@ -263,7 +263,7 @@ export function SessionHeader(props: {
                 await onSessionReopened?.(result.sessionId)
             }
         } catch (error) {
-            setReopenError(formatReopenError(error))
+            setReopenError(formatReopenError(error, t('dialog.reopen.resourceBusy')))
         }
     }
 

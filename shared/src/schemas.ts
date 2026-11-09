@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { SessionProjectSchema } from './sessionProject'
 import { COPILOT_AGENT_MODES, type CopilotAgentMode } from './copilotModes'
 import { CODEX_COLLABORATION_MODES, PERMISSION_MODES } from './modes'
 import { AgentConfigDescriptorSchema } from './agentConfig'
@@ -35,6 +36,9 @@ export const OpencodeClearOperationSchema = z.object({
 export type OpencodeClearOperation = z.infer<typeof OpencodeClearOperationSchema>
 
 const SessionCapabilitiesSchema = z.object({
+    deepseekStandalone: z.boolean().optional(),
+    deepseekCollaboration: z.boolean().optional(),
+    minimaxStandalone: z.boolean().optional(),
     concurrentClients: z.boolean().optional(),
     terminal: z.boolean().optional(),
     conversationHistory: ConversationHistoryCapabilitiesSchema.optional()
@@ -52,11 +56,35 @@ export const WorktreeMetadataSchema = z.object({
 
 export type WorktreeMetadata = z.infer<typeof WorktreeMetadataSchema>
 
+export const CodexRateLimitWindowSchema = z.object({
+    usedPercent: z.number().min(0).max(100),
+    windowDurationMins: z.number().positive(),
+    resetsAt: z.number().positive().optional()
+})
+
+export type CodexRateLimitWindow = z.infer<typeof CodexRateLimitWindowSchema>
+
+export const CodexRateLimitsSchema = z.object({
+    primary: CodexRateLimitWindowSchema.nullable().optional(),
+    secondary: CodexRateLimitWindowSchema.nullable().optional(),
+    planType: z.string().optional(),
+    limitId: z.string().optional(),
+    limitName: z.string().nullable().optional(),
+    updatedAt: z.number().positive()
+})
+
+export type CodexRateLimits = z.infer<typeof CodexRateLimitsSchema>
+
 export const MetadataSchema = z.object({
+    project: SessionProjectSchema.optional(),
     path: z.string(),
     host: z.string(),
     version: z.string().optional(),
     name: z.string().optional(),
+    // Hub-assigned high-water mark for sequential shared Codex /new labels.
+    // Kept separately from `name` so a later manual rename never reuses a number.
+    codexAutoNameSequence: z.number().int().positive().optional(),
+    codexAutoNameTitle: z.string().optional(),
     os: z.string().optional(),
     summary: MetadataSummarySchema.optional(),
     machineId: z.string().optional(),
@@ -66,6 +94,29 @@ export const MetadataSchema = z.object({
     // session as a branch of `<id>` instead of an unrelated duplicate.
     forkedFrom: z.string().optional(),
     codexSessionId: z.string().optional(),
+    // Present only when this runtime has a session-bound MiniMax admission gate.
+    hybridModel: z.object({ mode: z.enum(['openai', 'hybrid']) }).optional(),
+    deepseekCollaboration: z.object({ mode: z.enum(['openai', 'hybrid']) }).optional(),
+    modelReasoningEfforts: z.record(z.string(), z.string()).optional(),
+    minimaxApprovalReviewer: z.enum(['user', 'auto_review']).optional(),
+    // Explicit approval preference, independent of the filesystem sandbox.
+    codexApprovalPolicy: z.enum(['never', 'on-request']).optional(),
+    codexFullAuto: z.boolean().optional(),
+    modelRouting: z.object({
+        provider: z.enum(['openai', 'minimax', 'deepseek']),
+        model: z.string().optional(),
+        reason: z.enum(['manual', 'usage-limit']),
+        status: z.enum(['switching', 'active', 'failed']),
+        previousModel: z.string().optional(),
+        openaiApprovalsReviewer: z.enum(['user', 'auto_review']).optional(),
+        failedTurnId: z.string().optional(),
+        updatedAt: z.number()
+    }).optional(),
+    codexProviderHistory: z.object({
+        previousThreadIds: z.array(z.string()),
+        inheritedTurnIds: z.array(z.string()),
+        turnOrigins: z.record(z.string(), z.string()).optional()
+    }).optional(),
     // 原始 Codex thread id。导入 Codex 历史后，HAPI 会 fork 出自己的续写 thread；
     // codexSessionId 保存 fork 后的 thread，codexSourceSessionId 保留来源 thread 便于同步/展示。
     codexSourceSessionId: z.string().optional(),
@@ -160,7 +211,10 @@ export const MetadataSchema = z.object({
     // field stores only modelId (shared across all flavors); this preserves
     // the provider so web can resolve the exact model when two providers
     // share a modelId.
-    piSelectedModel: z.object({ provider: z.string(), modelId: z.string() }).nullable().optional()
+    piSelectedModel: z.object({ provider: z.string(), modelId: z.string() }).nullable().optional(),
+    // Account-level Codex rolling limits. This is UI-facing, non-secret data
+    // read from the official app-server account/rateLimits API.
+    codexRateLimits: CodexRateLimitsSchema.optional()
 })
 
 export type Metadata = z.infer<typeof MetadataSchema>

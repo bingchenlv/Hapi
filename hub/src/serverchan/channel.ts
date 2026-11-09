@@ -19,11 +19,12 @@ export class ServerChanChannel implements NotificationChannel {
         private readonly sendKey: string,
         private readonly publicUrl: string,
         private readonly visibilityTracker: VisibilityTracker | null = null,
-        private readonly backgroundOnly = false
+        private readonly backgroundOnly = false,
+        private readonly isDirectWeixinReply: (session: Session) => boolean = () => false
     ) {}
 
     async sendReady(session: Session): Promise<void> {
-        if (!session.active || this.shouldSuppress(session)) {
+        if (!session.active || this.shouldSuppress(session) || this.isDirectWeixinReply(session)) {
             return
         }
 
@@ -84,17 +85,33 @@ export class ServerChanChannel implements NotificationChannel {
             desp
         })
 
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'content-type': 'application/x-www-form-urlencoded'
-            },
-            body
-        })
+        let response: Response
+        try {
+            response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/x-www-form-urlencoded'
+                },
+                body,
+                signal: AbortSignal.timeout(10000),
+                redirect: 'error'
+            })
+        } catch {
+            // fetch errors can contain the URL, whose path holds the SendKey.
+            // The provider may have accepted the POST before a timeout; never retry here.
+            throw new Error('Server酱请求超时或网络失败，发送结果未知')
+        }
 
         if (!response.ok) {
-            const text = await response.text().catch(() => '')
-            throw new Error(`Server酱发送失败: HTTP ${response.status} ${response.statusText}${text ? ` - ${text}` : ''}`)
+            throw new Error(`Server酱发送失败: HTTP ${response.status}`)
+        }
+        const result: unknown = await response.json().catch(() => null)
+        if (!result || typeof result !== 'object' || !('code' in result) || typeof result.code !== 'number') {
+            throw new Error('Server酱回执无有效业务码，发送结果未知')
+        }
+        if (result.code !== 0) {
+            // Do not echo provider messages/bodies, which may contain sensitive request data.
+            throw new Error(`Server酱未接受消息: 业务码 ${result.code}`)
         }
     }
 

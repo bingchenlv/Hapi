@@ -1,13 +1,15 @@
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { z } from 'zod';
+import { SessionProjectSchema } from '@hapi/protocol';
 import { resolveCodexCommand, type CodexCommand } from '../utils/codexExecutable';
 import { parseCodexCliOverrides, stripCodexCliOverrides } from '../utils/codexCliOverrides';
 import { resolveCodexPermissionModeConfig } from '../utils/permissionModeConfig';
-import { getCodexSystemPrompt } from '../utils/systemPrompt';
+import { SHARED_USER_INPUT_CONFIG, withSharedUserInputPolicy } from './userInputPolicy';
 import type { CodexAppServerClient } from '../codexAppServerClient';
 
 export const SharedLaunchSchema = z.object({
+    sessionProject: SessionProjectSchema.optional(),
     startedBy: z.enum(['runner', 'terminal']).optional(),
     codexArgs: z.array(z.string()).optional(),
     permissionMode: z.enum(['default', 'read-only', 'safe-yolo', 'yolo']).optional(),
@@ -37,7 +39,7 @@ export function sharedLaunchConfig(options: SharedLaunchOptions, cwd: string): {
     const args = options.codexArgs ?? [];
     const serverArgs: string[] = [];
     let tuiArgs: string[] = [];
-    const config: Record<string, unknown> = {};
+    const config: Record<string, unknown> = { ...SHARED_USER_INPUT_CONFIG };
     const extraDirs: string[] = [];
     let model = options.model;
     let provider: string | undefined;
@@ -110,12 +112,16 @@ export function sharedLaunchConfig(options: SharedLaunchOptions, cwd: string): {
     if (extraDirs.length) config['sandbox_workspace_write.writable_roots'] = extraDirs.map(path => resolve(directory, path));
     if (provider) config.model_provider = provider;
     const permission = options.permissionMode ? resolveCodexPermissionModeConfig(options.permissionMode) : undefined;
+    // The hub also sends "default" when resuming a workspace-write session.
+    // That sandbox preset does not express who should review approvals; keep
+    // the user's configured reviewer (including auto_review) in that case.
+    const forceUserReviewer = permission && options.permissionMode !== 'default';
     if (permission) {
         // Explicit HAPI permission selection wins on every launch surface:
         // initial thread, attached TUI, and later native /new threads.
         config.approval_policy = permission.approvalPolicy;
         config.sandbox_mode = permission.sandbox;
-        config.approvals_reviewer = 'user';
+        if (forceUserReviewer) config.approvals_reviewer = 'user';
     }
     // The attached TUI resumes a remote task, which rejects permission flags.
     // The initial thread already has their resolved policy; inherit it there.
@@ -132,9 +138,10 @@ export function sharedLaunchConfig(options: SharedLaunchOptions, cwd: string): {
             ...(overrides.approvalPolicy ? { approvalPolicy: overrides.approvalPolicy } : {}),
             ...(overrides.sandbox ? { sandbox: overrides.sandbox } : {}),
             ...(autoReview ? { approvalPolicy: 'on-request', approvalsReviewer: 'auto_review', sandbox: 'workspace-write' } : {}),
-            ...(permission ? { approvalPolicy: permission.approvalPolicy, approvalsReviewer: 'user', sandbox: permission.sandbox } : {}),
+            ...(permission ? { approvalPolicy: permission.approvalPolicy, sandbox: permission.sandbox } : {}),
+            ...(forceUserReviewer ? { approvalsReviewer: 'user' } : {}),
             config: { ...config, ...(options.modelReasoningEffort ? { model_reasoning_effort: options.modelReasoningEffort } : {}) },
-            developerInstructions: getCodexSystemPrompt()
+            developerInstructions: withSharedUserInputPolicy()
         }
     };
 }

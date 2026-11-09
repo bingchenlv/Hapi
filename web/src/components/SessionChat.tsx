@@ -39,6 +39,8 @@ import { codexModelAdvertisesFastTier, getEffectiveCodexServiceTier } from '@/co
 import type { PendingSchedule } from '@/components/AssistantChat/ScheduleTimePicker'
 import { resolvePendingSchedule } from '@/components/AssistantChat/ScheduleTimePicker'
 import { HappyThread } from '@/components/AssistantChat/HappyThread'
+import { SessionHybridModelToggle } from '@/components/AssistantChat/SessionHybridModelToggle'
+import { sessionModelCatalog } from '@/lib/minimaxRouting'
 import { QueuedMessagesBar } from '@/components/AssistantChat/QueuedMessagesBar'
 import { ScratchlistDrawer } from '@/components/AssistantChat/ScratchlistPanel'
 import { useHubScratchlist } from '@/lib/use-hub-scratchlist'
@@ -56,6 +58,7 @@ import {
     type ComposerSendIntent,
 } from '@/lib/messageDelivery'
 import type { MessageDeliveryMode } from '@hapi/protocol'
+import { isDeepSeekModel } from '@hapi/protocol'
 import { isSteeringSupportedForSession } from '@hapi/protocol'
 import { createAttachmentAdapter } from '@/lib/attachmentAdapter'
 import { rewindMessageWindow, type OlderLoadOutcome } from '@/lib/message-window-store'
@@ -201,6 +204,7 @@ export async function applyModelChangeWithReasoningRollback(args: {
 
 export function shouldClearReasoningEffortForModelChange(args: {
     agentFlavor: string | null | undefined
+    previousModel?: SessionModelSelection
     previousModelReasoningEffort: string | null
     codexModels: readonly CodexModelSummary[]
     model: SessionModelSelection
@@ -209,6 +213,12 @@ export function shouldClearReasoningEffortForModelChange(args: {
         return false
     }
     if (args.agentFlavor === 'opencode') {
+        return false
+    }
+    const modelId = (value: SessionModelSelection | undefined) => typeof value === 'string' ? value : value?.modelId
+    if (isDeepSeekModel(modelId(args.model)) || isDeepSeekModel(modelId(args.previousModel))) {
+        // Native provider switching resolves the target model's saved effort.
+        // Clearing the source first would erase its own saved preference.
         return false
     }
     return args.agentFlavor === 'codex'
@@ -987,14 +997,14 @@ function SessionChatInner(props: SessionChatProps) {
         }
 
         const options: Array<{ value: string | null; label: string }> = []
-        for (const codexModel of codexModelsState.models) {
+        for (const codexModel of sessionModelCatalog(codexModelsState.models, props.session.metadata?.capabilities?.minimaxStandalone === true, props.session.metadata?.capabilities?.deepseekStandalone === true)) {
             options.push({
                 value: codexModel.id,
                 label: codexModel.displayName
             })
         }
         return options
-    }, [agentFlavor, codexModelsState.models])
+    }, [agentFlavor, codexModelsState.models, props.session.metadata?.capabilities?.minimaxStandalone, props.session.metadata?.capabilities?.deepseekStandalone])
     const codexSupportedReasoningEfforts = useMemo(
         () => agentFlavor === 'codex'
             ? getCodexModelReasoningEfforts(codexModelsState.models, props.session.model)
@@ -1404,9 +1414,14 @@ function SessionChatInner(props: SessionChatProps) {
 
     const reduced = useMemo(
         () => reduceChatBlocks(normalizedMessages, props.session.agentState, {
-            goalStateMessages: normalizedGoalStateMessages
+            goalStateMessages: normalizedGoalStateMessages,
+            rootThreadIds: [
+                ...(props.session.metadata?.codexSessionId ? [props.session.metadata.codexSessionId] : []),
+                ...props.session.metadata?.codexProviderHistory?.previousThreadIds ?? []
+            ]
         }),
-        [normalizedMessages, normalizedGoalStateMessages, props.session.agentState]
+        [normalizedMessages, normalizedGoalStateMessages, props.session.agentState,
+            props.session.metadata?.codexSessionId, props.session.metadata?.codexProviderHistory?.previousThreadIds]
     )
     const reconciled = useMemo(
         () => reconcileChatBlocks(reduced.blocks, blocksByIdRef.current),
@@ -1536,6 +1551,7 @@ function SessionChatInner(props: SessionChatProps) {
         const previousModelReasoningEffort = props.session.modelReasoningEffort
         const shouldClearReasoningEffort = shouldClearReasoningEffortForModelChange({
             agentFlavor,
+            previousModel: props.session.model,
             previousModelReasoningEffort,
             codexModels: codexModelsState.models,
             model
@@ -1558,6 +1574,7 @@ function SessionChatInner(props: SessionChatProps) {
     }, [
         agentFlavor,
         codexModelsState.models,
+        props.session.model,
         props.session.modelReasoningEffort,
         setModelReasoningEffort,
         setModel,
@@ -1946,6 +1963,7 @@ function SessionChatInner(props: SessionChatProps) {
                     </div>
 
                     <div className={outlineOpen ? 'max-sm:hidden' : undefined}>
+                        <SessionHybridModelToggle key={props.session.id} api={props.api} session={props.session} />
                         {codexCollaborationModeSupported && codexModelsState.error ? (
                             <div className="px-3 pb-2">
                                 <div className="mx-auto w-full max-w-content rounded-md bg-[var(--app-subtle-bg)] p-3 text-sm text-red-600">
@@ -2078,6 +2096,7 @@ function SessionChatInner(props: SessionChatProps) {
                         contextSize={reduced.latestUsage?.contextSize}
                         contextCacheRead={reduced.latestUsage?.cacheRead}
                         contextWindow={reduced.latestUsage?.contextWindow ?? piContextWindow}
+                        codexRateLimits={props.session.metadata?.codexRateLimits}
                         contextModel={reduced.latestUsage?.model ?? props.session.model}
                         controlledByUser={controlledByUser}
                         onCollaborationModeChange={

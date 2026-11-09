@@ -26,6 +26,7 @@ import { TunnelManager } from './tunnel'
 import { refreshRejectedRelayAuthKey, resolveRelayAuthKey } from './tunnel/relayAuth'
 import { waitForTunnelTlsReady } from './tunnel/tlsGate'
 import { ServerChanChannel } from './serverchan/channel'
+import { isWeixinReply } from './serverchan/weixinReply'
 import QRCode from 'qrcode'
 import type { Server as BunServer } from 'bun'
 import type { WebSocketData } from '@socket.io/bun-engine'
@@ -256,7 +257,8 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
             config.serverChanSendKey,
             config.publicUrl,
             visibilityTracker,
-            config.serverChanBackgroundOnly
+            config.serverChanBackgroundOnly,
+            session => isWeixinReply(session, store)
         ))
     }
 

@@ -121,11 +121,20 @@ function pickExistingSessionMetadata(metadata: Metadata | null | undefined): Par
 
     const preserved: Partial<Metadata> = {}
 
+    if (metadata.project !== undefined) preserved.project = metadata.project
     if (metadata.name !== undefined) preserved.name = metadata.name
     if (metadata.summary !== undefined) preserved.summary = metadata.summary
     if (metadata.claudeSessionId !== undefined) preserved.claudeSessionId = metadata.claudeSessionId
     if (metadata.codexSessionId !== undefined) preserved.codexSessionId = metadata.codexSessionId
     if (metadata.codexSourceSessionId !== undefined) preserved.codexSourceSessionId = metadata.codexSourceSessionId
+    if (metadata.codexRateLimits !== undefined) preserved.codexRateLimits = metadata.codexRateLimits
+    if (metadata.codexProviderHistory !== undefined) preserved.codexProviderHistory = metadata.codexProviderHistory
+    if (metadata.modelRouting !== undefined) preserved.modelRouting = metadata.modelRouting
+    if (metadata.modelReasoningEfforts !== undefined) preserved.modelReasoningEfforts = metadata.modelReasoningEfforts
+    if (metadata.hybridModel !== undefined) preserved.hybridModel = metadata.hybridModel
+    if (metadata.minimaxApprovalReviewer !== undefined) preserved.minimaxApprovalReviewer = metadata.minimaxApprovalReviewer
+    if (metadata.codexApprovalPolicy !== undefined) preserved.codexApprovalPolicy = metadata.codexApprovalPolicy
+    if (metadata.codexFullAuto !== undefined) preserved.codexFullAuto = metadata.codexFullAuto
     if (metadata.geminiSessionId !== undefined) preserved.geminiSessionId = metadata.geminiSessionId
     if (metadata.opencodeSessionId !== undefined) preserved.opencodeSessionId = metadata.opencodeSessionId
     if (metadata.grokSessionId !== undefined) preserved.grokSessionId = metadata.grokSessionId
@@ -340,6 +349,7 @@ export async function bootstrapExistingSession(options: {
     flavor: string
     startedBy?: SessionStartedBy
     workingDirectory: string
+    preserveProjectWorkingDirectory?: boolean
     metadataOverrides?: Partial<Metadata>
 }): Promise<SessionBootstrapResult> {
     const startedBy = options.startedBy ?? 'terminal'
@@ -352,10 +362,12 @@ export async function bootstrapExistingSession(options: {
     })
 
     const sessionInfo = await api.getSession(options.sessionId)
+    const workingDirectory = options.preserveProjectWorkingDirectory && sessionInfo.metadata?.project
+        ? sessionInfo.metadata.path : options.workingDirectory
     const baseMetadata = buildSessionMetadata({
         flavor: options.flavor,
         startedBy,
-        workingDirectory: options.workingDirectory,
+        workingDirectory,
         machineId
     })
     const buildUpdatedMetadata = (current: Metadata | null | undefined): Metadata => {
@@ -387,6 +399,6 @@ export async function bootstrapExistingSession(options: {
         metadata,
         machineId,
         startedBy,
-        workingDirectory: options.workingDirectory
+        workingDirectory
     }
 }

@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { SessionProjectSchema } from './sessionProject'
 import {
     AttachmentMetadataSchema,
     CodexCollaborationModeSchema,
@@ -133,7 +134,7 @@ export type SpawnResponse =
     | {
         type: 'error'
         message: string
-        code?: 'agent_unavailable' | 'runner_upgrade_required' | 'outside_workspace_roots'
+        code?: 'agent_unavailable' | 'runner_upgrade_required' | 'outside_workspace_roots' | 'resource_busy'
         agent?: z.infer<typeof AgentFlavorSchema>
     }
 
@@ -548,6 +549,34 @@ export const SendMessageRequestSchema = z.object({
 
 export type SendMessageRequest = z.infer<typeof SendMessageRequestSchema>
 
+/** Versioned maintenance transport; ordinary messages retain their old contract. */
+export const MaintenanceMessageRequestSchema = z.object({
+    version: z.literal(1),
+    requestKey: z.string().uuid(),
+    text: z.string().min(1).max(32_768).refine(value =>
+        !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value),
+        'text must be well-formed Unicode'),
+    contentSha256: z.string().regex(/^[a-f0-9]{64}$/)
+}).strict()
+export type MaintenanceMessageRequest = z.infer<typeof MaintenanceMessageRequestSchema>
+
+export function maintenanceMessageDigestInput(sessionId: string, request: Pick<MaintenanceMessageRequest, 'requestKey' | 'text'>): string {
+    return JSON.stringify(['hapi-maintenance-message-v1', sessionId, request.requestKey, request.text])
+}
+
+export const MaintenanceMessageReceiptSchema = z.object({
+    version: z.literal(1),
+    sessionId: z.string().uuid(),
+    requestKey: z.string().uuid(),
+    contentSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    messageId: z.string().uuid(),
+    inserted: z.boolean(),
+    contentVerified: z.boolean(),
+    state: z.enum(['stored', 'invoked', 'indeterminate', 'missing_unknown']),
+    modelCompletionVerified: z.literal(false)
+}).strict()
+export type MaintenanceMessageReceipt = z.infer<typeof MaintenanceMessageReceiptSchema>
+
 export const ForkConversationRequestSchema = z.object({
     messageLocalId: z.string().min(1).optional()
 })
@@ -626,7 +655,13 @@ export type QueuedStateResponse = {
     }>
 }
 
+export const SetSessionProjectRequestSchema = z.object({
+    project: SessionProjectSchema.nullable(),
+    expectedMetadataVersion: z.number().int().nonnegative()
+}).strict()
+
 export const SpawnSessionRequestSchema = z.object({
+    sourceProjectSessionId: z.string().min(1).optional(),
     directory: z.string().min(1),
     agent: AgentFlavorSchema.optional(),
     model: z.string().optional(),

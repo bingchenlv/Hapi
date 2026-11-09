@@ -3,6 +3,8 @@ export const RPC_METHODS = {
     Abort: 'abort',
     Switch: 'switch',
     SetSessionConfig: 'set-session-config',
+    HybridModel: 'hybrid-model',
+    DeepSeekCollaboration: 'deepseek-collaboration',
     KillSession: 'killSession',
     HandoffLocal: 'handoff-local',
     SpawnHappySession: 'spawn-happy-session',

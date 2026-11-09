@@ -49,7 +49,9 @@ export async function attachSharedSession(runtime: CodexRuntimeRecord, sessionId
 }
 
 export async function runSharedCodex(raw: SharedLaunchOptions): Promise<void> {
-    const options = SharedLaunchSchema.parse({ ...raw, workingDirectory: raw.workingDirectory ?? getInvokedCwd() });
+    const options = SharedLaunchSchema.parse({ ...raw,
+        sessionProject: raw.sessionProject ?? (process.env.HAPI_SESSION_PROJECT ? JSON.parse(process.env.HAPI_SESSION_PROJECT) : undefined),
+        workingDirectory: raw.workingDirectory ?? getInvokedCwd() });
     if (options.existingSessionId) {
         const api = await ApiClient.create();
         const session = await api.getSession(options.existingSessionId);
@@ -60,6 +62,7 @@ export async function runSharedCodex(raw: SharedLaunchOptions): Promise<void> {
         }
         if (session.active) throw new Error('Existing session is active in another or legacy runtime. Stop it explicitly before cold resume; no hot migration.');
         options.resumeSessionId ??= session.metadata?.codexSessionId;
+        options.model ??= session.model ?? undefined;
         if (!options.resumeSessionId) throw new Error('Existing HAPI session has no Codex thread binding');
     }
     const runner = await readRunnerState();
