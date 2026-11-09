@@ -1,0 +1,94 @@
+import { fireEvent, render, screen } from '@testing-library/react'
+import { describe, expect, it, vi } from 'vitest'
+import { I18nProvider } from '@/lib/i18n-context'
+import { PermissionField } from './PermissionField'
+
+function renderField(props: Partial<Parameters<typeof PermissionField>[0]> = {}) {
+    return render(
+        <I18nProvider>
+            <PermissionField
+                agent="claude"
+                nativeValue="default"
+                yoloMode={false}
+                isDisabled={false}
+                onNativeChange={vi.fn()}
+                onYoloToggle={vi.fn()}
+                {...props}
+            />
+        </I18nProvider>
+    )
+}
+
+describe('PermissionField', () => {
+    it('offers only native shared permission modes for Codex', () => {
+        renderField({ agent: 'codex' })
+        expect(screen.getAllByRole('option').map(option => (option as HTMLOptionElement).value))
+            .toEqual(['default', 'read-only', 'autoReview', 'yolo'])
+    })
+    it('renders native permission modes for codex-family agents', () => {
+        const onChange = vi.fn()
+        renderField({ agent: 'copilot', nativeValue: 'default', onNativeChange: onChange })
+        expect(screen.getByRole('combobox')).toBeTruthy()
+        expect(screen.getByRole('option', { name: 'Yolo' })).toBeTruthy()
+        fireEvent.change(screen.getByRole('combobox'), { target: { value: 'yolo' } })
+        expect(onChange).toHaveBeenCalledWith('yolo')
+    })
+
+    it('offers Auto when Grok advertises the account feature', () => {
+        renderField({ agent: 'grok', autoPermissionModeSupported: true })
+        expect(screen.getByRole('option', { name: 'Auto' })).not.toBeDisabled()
+    })
+
+    it('shows Auto as unavailable when Grok does not advertise it', () => {
+        renderField({ agent: 'grok', autoPermissionModeSupported: false })
+        expect(screen.getByRole('option', { name: 'Auto (unavailable)' })).toBeDisabled()
+        expect(screen.getByText(/did not enable Auto permissions/i)).toBeInTheDocument()
+    })
+
+    it('renders the Antigravity permission modes as a native select', () => {
+        const onChange = vi.fn()
+        renderField({ agent: 'agy', nativeValue: 'request-review', onNativeChange: onChange })
+        expect(screen.queryByRole('switch')).toBeNull()
+        expect(screen.getAllByRole('option').map(option => (option as HTMLOptionElement).value))
+            .toEqual(['request-review', 'acceptEdits', 'plan', 'always-proceed'])
+        fireEvent.change(screen.getByRole('combobox'), { target: { value: 'plan' } })
+        expect(onChange).toHaveBeenCalledWith('plan')
+    })
+
+    it('renders Claude permission modes as a native select', () => {
+        const onChange = vi.fn()
+        renderField({ agent: 'claude', nativeValue: 'default', onNativeChange: onChange })
+        expect(screen.getByRole('combobox')).toBeTruthy()
+        expect(screen.getByRole('option', { name: 'Plan Mode' })).toBeTruthy()
+        fireEvent.change(screen.getByRole('combobox'), { target: { value: 'plan' } })
+        expect(onChange).toHaveBeenCalledWith('plan')
+    })
+
+    it('renders Cursor permission modes as a native select', () => {
+        const onChange = vi.fn()
+        renderField({ agent: 'cursor', nativeValue: 'default', onNativeChange: onChange })
+        expect(screen.getByRole('combobox')).toBeTruthy()
+        expect(screen.getByRole('option', { name: 'Plan Mode' })).toBeTruthy()
+        expect(screen.getByRole('option', { name: 'Ask Mode' })).toBeTruthy()
+        fireEvent.change(screen.getByRole('combobox'), { target: { value: 'plan' } })
+        expect(onChange).toHaveBeenCalledWith('plan')
+    })
+
+    it('offers every built-in agent with a permission select its native modes, not the YOLO toggle', () => {
+        for (const agent of ['agy', 'claude', 'codex', 'copilot', 'cursor', 'gemini', 'grok', 'kimi', 'opencode'] as const) {
+            const { unmount } = renderField({ agent })
+            expect(screen.getByRole('combobox')).toBeTruthy()
+            expect(screen.queryByRole('checkbox')).toBeNull()
+            unmount()
+        }
+    })
+
+    it('reports Pi permission as managed instead of offering a silent YOLO toggle', () => {
+        const { container } = renderField({ agent: 'pi' })
+        expect(screen.getByTestId('permission-managed')).toBeTruthy()
+        expect(screen.getByText(/managed by agent/i)).toBeInTheDocument()
+        expect(screen.queryByRole('checkbox')).toBeNull()
+        expect(screen.queryByRole('combobox')).toBeNull()
+        expect(container.firstChild).not.toBeNull()
+    })
+})

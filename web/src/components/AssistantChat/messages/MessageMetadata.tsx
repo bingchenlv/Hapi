@@ -1,0 +1,188 @@
+import { formatDuration } from '@/chat/presentation'
+import type { RoundModelUsage, RoundSummary, UsageData } from '@/chat/types'
+
+export type MessageMetadataProps = {
+    durationMs?: number
+    usage?: UsageData
+    model?: string | null
+    /**
+     * Distinct turn count for the surrounding response group. Single-turn
+     * footers pass `undefined` (or any value < 2).
+     */
+    turnCount?: number
+    roundSummary?: RoundSummary
+    className?: string
+}
+
+function formatCompactTokenCount(value: number): string {
+    if (value < 1_000) return Math.round(value).toLocaleString()
+    const divisor = value >= 1_000_000 ? 1_000_000 : 1_000
+    const suffix = divisor === 1_000_000 ? 'm' : 'k'
+    return `${(Math.round((value / divisor) * 10) / 10).toString()}${suffix}`
+}
+
+function formatOneDecimal(value: number): string {
+    return (Math.round(value * 10) / 10).toString()
+}
+
+function formatPercentage(value: number): string {
+    return formatOneDecimal(value)
+}
+
+function formatRoundDuration(durationMs: number): string {
+    if (durationMs < 60_000) return formatOneDecimal(durationMs / 1000) + 's'
+    return formatDuration(durationMs)
+}
+
+function formatUsd(value: number): string {
+    if (value < 0.0001) return '<$0.0001'
+    return value >= 0.01 ? `$${value.toFixed(3)}` : `$${value.toFixed(4)}`
+}
+
+function getRoundUsage(summary: RoundSummary): UsageData | undefined {
+    const entries = Object.values(summary.modelUsage)
+    const hasModelToken = entries.some((usage: RoundModelUsage) => Object.values(usage).some(token => typeof token === 'number'))
+    if (!hasModelToken) return summary.usage
+
+    return entries.reduce<UsageData>((total, usage) => ({
+        input_tokens: total.input_tokens + (usage.inputTokens ?? 0),
+        output_tokens: total.output_tokens + (usage.outputTokens ?? 0),
+        cache_creation_input_tokens: (total.cache_creation_input_tokens ?? 0) + (usage.cacheCreationInputTokens ?? 0),
+        cache_read_input_tokens: total.cache_read_input_tokens === undefined && usage.cacheReadInputTokens === undefined
+            ? undefined
+            : (total.cache_read_input_tokens ?? 0) + (usage.cacheReadInputTokens ?? 0)
+    }), { input_tokens: 0, output_tokens: 0 })
+}
+
+function formatTokensPerSecond({ generationMs, generationOutputTokens }: RoundSummary): string | undefined {
+    if (generationMs === undefined || !Number.isSafeInteger(generationMs) || generationMs <= 0
+        || generationOutputTokens === undefined || !Number.isSafeInteger(generationOutputTokens) || generationOutputTokens <= 0) {
+        return undefined
+    }
+    const tokensPerSecond = generationOutputTokens / (generationMs / 1_000)
+    return Number.isFinite(tokensPerSecond) ? `${tokensPerSecond.toFixed(1)} tok/s` : undefined
+}
+
+function buildAgyRoundLabels(summary: RoundSummary): string[] {
+    const parts: string[] = []
+    const usage = summary.agyUsage
+    if (usage) {
+        const breakdown = [
+            usage.input_tokens !== undefined ? `${formatCompactTokenCount(usage.input_tokens)} in` : undefined,
+            usage.output_tokens !== undefined ? `${formatCompactTokenCount(usage.output_tokens)} out` : undefined,
+            usage.thinking_tokens !== undefined ? `${formatCompactTokenCount(usage.thinking_tokens)} thinking` : undefined
+        ].filter(Boolean).join(' · ')
+        const total = usage.total_tokens !== undefined ? formatCompactTokenCount(usage.total_tokens) : undefined
+        if (total || breakdown) parts.push(`Tokens: ${total ? total + (breakdown ? ` (${breakdown})` : '') : breakdown}`)
+        // agy's input excludes cache reads.
+        const input = usage.input_tokens
+        const cached = usage.cache_read_tokens
+        if (input !== undefined && cached !== undefined && cached > 0 && Number.isSafeInteger(input + cached)) {
+            parts.push(`Cached input: ${formatPercentage(cached / (input + cached) * 100)}%`)
+        }
+    }
+    const round: string[] = []
+    if (summary.durationMs !== undefined) round.push(formatRoundDuration(summary.durationMs))
+    const tokensPerSecond = formatTokensPerSecond(summary)
+    if (tokensPerSecond) round.push(tokensPerSecond)
+    if (round.length > 0) parts.push(`Round: ${round.join(' · ')}`)
+    return parts
+}
+
+function buildRoundSummaryLabels(summary: RoundSummary, fallbackModel?: string | null): string[] {
+    const parts: string[] = []
+    const models = Object.keys(summary.modelUsage)
+    const model = models.length > 0 ? models.join(', ') : fallbackModel
+    if (model) parts.push(`${models.length > 1 ? 'Models' : 'Model'}: ${model}`)
+
+    if (summary.provider === 'agy') return [...parts, ...buildAgyRoundLabels(summary)]
+
+    const isCodex = summary.provider === 'codex'
+    const usage = isCodex && summary.usage ? summary.usage : getRoundUsage(summary)
+    if (usage && (!isCodex || (Number.isSafeInteger(usage.input_tokens) && usage.input_tokens >= 0
+        && Number.isSafeInteger(usage.output_tokens) && usage.output_tokens >= 0))) {
+        // Codex input already includes cache hits; Claude reports them separately.
+        const input = isCodex ? usage.input_tokens : usage.input_tokens
+            + (usage.cache_creation_input_tokens ?? 0)
+            + (usage.cache_read_input_tokens ?? 0)
+        const total = input + usage.output_tokens
+        parts.push(`Tokens: ${formatCompactTokenCount(total)} (${formatCompactTokenCount(input)} in · ${formatCompactTokenCount(usage.output_tokens)} out)`)
+
+        const economics: string[] = []
+        const cached = usage.cache_read_input_tokens
+        const showCache = isCodex
+            ? Number.isSafeInteger(input) && input > 0
+                && cached !== undefined && Number.isSafeInteger(cached) && cached >= 0 && cached <= input
+            : input > 0 && (cached ?? 0) > 0
+        if (showCache) {
+            economics.push(`Cached input: ${formatPercentage(((cached ?? 0) / input) * 100)}%`)
+        }
+        if (summary.totalCostUsd !== undefined && summary.totalCostUsd > 0) {
+            economics.push(`Cost: ${formatUsd(summary.totalCostUsd)}`)
+        }
+        if (economics.length > 0) parts.push(economics.join(' · '))
+    } else if (summary.totalCostUsd !== undefined && summary.totalCostUsd > 0) {
+        parts.push(`Cost: ${formatUsd(summary.totalCostUsd)}`)
+    }
+
+    const round: string[] = []
+    if (summary.durationMs !== undefined && summary.durationMs >= 0) round.push(formatRoundDuration(summary.durationMs))
+    if (summary.numTurns !== undefined && summary.numTurns > 0) {
+        round.push(`${summary.numTurns} turn${summary.numTurns === 1 ? '' : 's'}`)
+    }
+    const tokensPerSecond = formatTokensPerSecond(summary)
+    if (tokensPerSecond) round.push(tokensPerSecond)
+    if (round.length > 0) parts.push(`Round: ${round.join(' · ')}`)
+    return parts
+}
+
+export function buildMessageMetadataLabels({ durationMs, usage, model, turnCount, roundSummary }: Omit<MessageMetadataProps, 'className'>): string[] {
+    if (roundSummary) return buildRoundSummaryLabels(roundSummary, model)
+    const parts: string[] = []
+    // Aggregated footers represent a response group with multiple distinct
+    // turns. When the caller passes `turnCount >= 2` they have already
+    // dedup-joined `model` into a comma-separated list and summed `usage`
+    // across turns; we adjust the labels to reflect that.
+    const isAggregated = typeof turnCount === 'number' && turnCount >= 2
+
+    if (typeof durationMs === 'number' && durationMs >= 0) {
+        parts.push(`Duration: ${formatDuration(durationMs)}`)
+    }
+
+    const tier = usage?.service_tier
+    const isStandardTier = tier?.toLowerCase() === 'standard'
+    if (model) {
+        // Pluralize the label when the caller has joined multiple model ids.
+        const modelLabel = isAggregated && model.includes(', ') ? 'Models' : 'Model'
+        let label = `${modelLabel}: ${model}`
+        if (tier && !isStandardTier) label += ` (${tier})`
+        parts.push(label)
+    } else if (tier && !isStandardTier) {
+        parts.push(`Tier: ${tier}`)
+    }
+
+    if (usage) {
+        const total = usage.input_tokens + usage.output_tokens
+        const formatToken = (n: number) => n.toLocaleString()
+        parts.push(`Tokens: ${formatToken(total)} total (${formatToken(usage.input_tokens)} in / ${formatToken(usage.output_tokens)} out)`)
+    }
+
+    if (isAggregated) {
+        parts.push(`${turnCount} turns`)
+    }
+
+    return parts
+}
+
+export function MessageMetadata({ durationMs, usage, model, turnCount, roundSummary, className }: MessageMetadataProps) {
+    const parts = buildMessageMetadataLabels({ durationMs, usage, model, turnCount, roundSummary })
+    if (parts.length === 0) return null
+
+    return (
+        <div className={`flex max-w-[min(22rem,calc(100vw-1rem))] flex-col gap-1 text-xs leading-tight text-[var(--app-fg)] ${className || ''}`}>
+            {parts.map((part, i) => (
+                <span key={i} className="break-words">{part}</span>
+            ))}
+        </div>
+    )
+}

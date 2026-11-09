@@ -1,0 +1,267 @@
+import { getAgyModelChoices, getAgyModelLabel, getClaudeModelChoices, getClaudeModelLabel } from '@hapi/protocol'
+import type { ClaudeModelSummary } from '@hapi/protocol/apiTypes'
+import { MODEL_OPTIONS } from '@/components/NewSession/types'
+import { CURSOR_AUTO_MODEL_LABEL } from '@/lib/cursorModelOptions'
+import { getClaudeComposerModelOptions, getNextClaudeComposerModel } from './claudeModelOptions'
+import type { ClaudeComposerModelOption } from './claudeModelOptions'
+
+export type ModelOption = ClaudeComposerModelOption
+
+function normalizeCurrentModel(model?: string | null): string | null {
+    const trimmedModel = model?.trim()
+    if (!trimmedModel || trimmedModel === 'auto' || trimmedModel === 'default') {
+        return null
+    }
+
+    return trimmedModel
+}
+
+/** Base id before ACP wire suffix, e.g. `claude-opus-4-8[effort=high]` → `claude-opus-4-8`. */
+function cursorWireBaseId(modelId: string): string {
+    const bracket = modelId.indexOf('[')
+    return bracket === -1 ? modelId : modelId.slice(0, bracket)
+}
+
+function cursorCatalogCoversCurrentModel(options: ModelOption[], currentModel: string): boolean {
+    if (options.some((option) => option.value === currentModel)) {
+        return true
+    }
+    const baseId = cursorWireBaseId(currentModel)
+    return options.some((option) => option.value === baseId)
+}
+
+function withCurrentModelOption(
+    options: ModelOption[],
+    currentModel?: string | null,
+    resolveLabel?: (modelId: string) => string | null
+): ModelOption[] {
+    const normalizedCurrentModel = normalizeCurrentModel(currentModel)
+    if (!normalizedCurrentModel || options.some((option) => option.value === normalizedCurrentModel)) {
+        return options
+    }
+
+    const nextOptions = [...options]
+    const autoIndex = nextOptions.findIndex((option) => option.value === null || option.value === 'auto')
+    nextOptions.splice(autoIndex >= 0 ? autoIndex + 1 : 0, 0, {
+        value: normalizedCurrentModel,
+        label: resolveLabel?.(normalizedCurrentModel) ?? normalizedCurrentModel
+    })
+    return nextOptions
+}
+
+function getClaudeModelOptions(currentModel?: string | null, customOptions?: ModelOption[]): ModelOption[] {
+    if (!customOptions || customOptions.length === 0) {
+        return getClaudeComposerModelOptions(currentModel)
+    }
+
+    // The machine's catalog is the CLI's own /model list, so it replaces the
+    // built-in presets rather than extending them. A CLI that offers a 1M
+    // variant as a separate choice lists it as its own row (`opus[1m]`), so
+    // the built-in `[1m]` presets would only add choices the CLI does not
+    // offer. A saved model it does not list stays as the current model.
+    const listed: ModelOption[] = []
+    for (const option of customOptions) {
+        const value = normalizeCurrentModel(option.value)
+        if (value && !listed.some((existing) => existing.value === value)) {
+            listed.push(option.group ? { value, label: option.label, group: option.group } : { value, label: option.label })
+        }
+    }
+
+    return withCurrentModelOption(
+        [{ value: null, label: 'Default' }, ...listed],
+        currentModel,
+        getClaudeModelLabel
+    )
+}
+
+/**
+ * Create-session model options for Claude (`auto` = Default). A saved model the
+ * loaded catalog no longer offers stays selectable, labelled as such, so the
+ * form never silently switches it to another model.
+ */
+export function getClaudeLaunchModelOptions(
+    catalog: readonly ClaudeModelSummary[],
+    selectedModel: string,
+    notListedSuffix: string,
+    otherModelsLabel: string
+): Array<{ value: string; label: string; group?: string }> {
+    const catalogOptions = getClaudeCatalogOptions(catalog, otherModelsLabel)
+    const selected = normalizeCurrentModel(selectedModel)
+    const isGone = catalog.length > 0
+        && selected !== null
+        && !catalogOptions.some((option) => option.value === selected)
+
+    return getClaudeModelOptions(selectedModel, catalogOptions).map((option) => ({
+        ...option,
+        value: option.value ?? 'auto',
+        label: isGone && option.value === selected ? `${option.label} (${notListedSuffix})` : option.label
+    }))
+}
+
+/** Catalog options with earlier versions under `otherModelsLabel`, as Claude Code's model sheet lists them. */
+export function getClaudeCatalogOptions(catalog: readonly ClaudeModelSummary[], otherModelsLabel: string): ModelOption[] {
+    return getClaudeModelChoices(catalog).map(({ value, label, section }) => (
+        section === 'other' ? { value, label, group: otherModelsLabel } : { value, label }
+    ))
+}
+
+function getAgyModelOptions(currentModel?: string | null, customOptions?: ModelOption[]): ModelOption[] {
+    // The built-in list stands in until the machine answers. Neither list carries
+    // a null entry: agy has no mid-session "back to default".
+    const machineOptions = (customOptions ?? []).filter((option) => Boolean(option.value))
+    const options = machineOptions.length > 0
+        ? machineOptions
+        : getAgyModelChoices(MODEL_OPTIONS.agy.filter((m) => m.value !== 'auto').map((m) => ({
+            modelId: m.value, name: m.label
+        }))).map((m) => ({ value: m.modelId, label: m.name }))
+    // A session can be running a model the machine no longer lists. It stays
+    // selectable; the lookup only keeps a known preset readable.
+    return withCurrentModelOption(options, currentModel, getAgyModelLabel)
+}
+
+function getGeminiModelOptions(currentModel?: string | null): ModelOption[] {
+    const options = MODEL_OPTIONS.gemini.map((m) => ({
+        value: m.value === 'auto' ? null : m.value,
+        label: m.label
+    }))
+    return withCurrentModelOption(options, currentModel)
+}
+
+function getNextGeminiModel(currentModel?: string | null): string | null {
+    const options = getGeminiModelOptions(currentModel)
+    const currentIndex = options.findIndex((o) => o.value === (currentModel ?? null))
+    if (currentIndex === -1) {
+        return options[0]?.value ?? null
+    }
+    return options[(currentIndex + 1) % options.length]?.value ?? null
+}
+
+export function getModelOptionsForFlavor(
+    flavor: string | undefined | null,
+    currentModel?: string | null,
+    customOptions?: ModelOption[]
+): ModelOption[] {
+    if (flavor === 'agy') {
+        return getAgyModelOptions(currentModel, customOptions)
+    }
+    if (flavor === 'claude') {
+        return getClaudeModelOptions(currentModel, customOptions)
+    }
+    if (customOptions && customOptions.length > 0) {
+        if (flavor === 'cursor') {
+            const normalizedCurrent = normalizeCurrentModel(currentModel)
+            if (!normalizedCurrent || cursorCatalogCoversCurrentModel(customOptions, normalizedCurrent)) {
+                return customOptions
+            }
+            return withCurrentModelOption(customOptions, currentModel)
+        }
+        return withCurrentModelOption(customOptions, currentModel)
+    }
+    if (flavor === 'gemini') {
+        return getGeminiModelOptions(currentModel)
+    }
+    // OpenCode discovers models dynamically via the listOpencodeModels RPC. Until
+    // those options arrive, render an empty list rather than the Claude fallback —
+    // the latter would surface unrelated Claude models in an OpenCode session.
+    if (flavor === 'opencode') {
+        return []
+    }
+    // DSH is the same shape: its catalog arrives via the session's ACP model
+    // metadata (SessionChat's dshModelOptions). While discovery is pending,
+    // failed, or returned nothing, an empty list must win over the Claude
+    // fallback — surfacing Claude presets in a DeepSeek session would let the
+    // picker enqueue `sonnet`-style ids the ACP server rejects.
+    if (flavor === 'dsh') {
+        return []
+    }
+    if (flavor === 'cursor') {
+        return withCurrentModelOption([{ value: 'auto', label: CURSOR_AUTO_MODEL_LABEL }], currentModel)
+    }
+    // Kimi has no predefined model list — show just the auto/default option.
+    if (flavor === 'kimi') {
+        return withCurrentModelOption([{ value: null, label: 'Default' }], currentModel)
+    }
+    if (flavor === 'copilot') {
+        if (customOptions && customOptions.length > 0) {
+            return withCurrentModelOption(customOptions, currentModel)
+        }
+        return withCurrentModelOption([{ value: null, label: 'Auto' }], currentModel)
+    }
+    if (flavor === 'grok') {
+        return withCurrentModelOption([{ value: null, label: 'Default' }], currentModel)
+    }
+    // Pi model list is provided dynamically via piModels prop in SessionChat,
+    // not through this function. Show just the auto/default option here to
+    // prevent falling through to the Claude preset cycler (which would
+    // surface unrelated Claude models and let set-session-config push
+    // `sonnet`/`opus` ids into a Pi session).
+    if (flavor === 'pi') {
+        return withCurrentModelOption([{ value: null, label: 'Default' }], currentModel)
+    }
+    return getClaudeModelOptions(currentModel)
+}
+
+export function getNextModelForFlavor(
+    flavor: string | undefined | null,
+    currentModel?: string | null,
+    customOptions?: ModelOption[]
+): string | null {
+    if (flavor === 'agy') {
+        const options = getAgyModelOptions(currentModel, customOptions)
+        const currentIndex = options.findIndex((option) => option.value === (normalizeCurrentModel(currentModel) ?? null))
+        if (currentIndex === -1) {
+            return options.find((option) => option.value !== null)?.value ?? null
+        }
+        return options[(currentIndex + 1) % options.length]?.value ?? null
+    }
+    if (flavor === 'claude') {
+        const options = getClaudeModelOptions(currentModel, customOptions)
+        const currentIndex = options.findIndex((option) => option.value === (normalizeCurrentModel(currentModel) ?? null))
+        if (currentIndex === -1) {
+            return options[0]?.value ?? null
+        }
+        return options[(currentIndex + 1) % options.length]?.value ?? null
+    }
+    if (customOptions && customOptions.length > 0) {
+        const options = getModelOptionsForFlavor(flavor, currentModel, customOptions)
+        const currentIndex = options.findIndex((option) => option.value === (normalizeCurrentModel(currentModel) ?? null))
+        if (currentIndex === -1) {
+            return options.find((option) => option.value !== null)?.value ?? null
+        }
+        return options[(currentIndex + 1) % options.length]?.value ?? null
+    }
+    if (flavor === 'gemini') {
+        return getNextGeminiModel(currentModel)
+    }
+    // OpenCode discovers models dynamically via the listOpencodeModels RPC. Until
+    // those options arrive, pressing the Ctrl/Cmd+M shortcut must not fall through
+    // to the Claude preset cycler — that would post `sonnet`/`opus` into an
+    // OpenCode session and the next turn would attempt `session/set_model` with a
+    // Claude id. Keep the current model unchanged instead.
+    if (flavor === 'opencode') {
+        return normalizeCurrentModel(currentModel)
+    }
+    // DSH: same guard for the Ctrl/Cmd+M cycler — without the catalog the
+    // shortcut must keep the current model, never cycle into Claude presets.
+    if (flavor === 'dsh') {
+        return normalizeCurrentModel(currentModel)
+    }
+    if (flavor === 'cursor') {
+        return normalizeCurrentModel(currentModel)
+    }
+    if (flavor === 'kimi') {
+        return normalizeCurrentModel(currentModel)
+    }
+    if (flavor === 'copilot') {
+        return normalizeCurrentModel(currentModel)
+    }
+    if (flavor === 'grok') {
+        return normalizeCurrentModel(currentModel)
+    }
+    // Pi model list is provided dynamically via piModels prop — pressing
+    // Ctrl/Cmd+M must not fall through to the Claude preset cycler.
+    if (flavor === 'pi') {
+        return normalizeCurrentModel(currentModel)
+    }
+    return getNextClaudeComposerModel(currentModel)
+}

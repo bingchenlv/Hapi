@@ -1,0 +1,260 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+type ToolHandler = (args: Record<string, unknown>) => Promise<unknown>
+
+const harness = vi.hoisted(() => ({
+    tools: new Map<string, ToolHandler>(),
+    configs: new Map<string, Record<string, unknown>>(),
+    callTool: vi.fn(async (_request: unknown) => ({
+        content: [{ type: 'text', text: 'forwarded' }],
+        isError: false
+    }))
+}))
+
+vi.mock('@modelcontextprotocol/sdk/server/mcp.js', () => ({
+    McpServer: class {
+        registerTool(name: string, config: Record<string, unknown>, handler: ToolHandler): void {
+            harness.tools.set(name, handler)
+            harness.configs.set(name, config)
+        }
+
+        async connect(): Promise<void> {}
+    }
+}))
+
+vi.mock('@modelcontextprotocol/sdk/server/stdio.js', () => ({
+    StdioServerTransport: class {}
+}))
+
+vi.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
+    Client: class {
+        async connect(): Promise<void> {}
+
+        async callTool(request: unknown): Promise<unknown> {
+            return harness.callTool(request)
+        }
+    }
+}))
+
+vi.mock('@modelcontextprotocol/sdk/client/streamableHttp.js', () => ({
+    StreamableHTTPClientTransport: class {
+        constructor(_url: URL) {}
+    }
+}))
+
+import { runHappyMcpStdioBridge } from './happyMcpStdioBridge'
+
+describe('runHappyMcpStdioBridge tool forwarding', () => {
+    beforeEach(() => {
+        harness.tools.clear()
+        harness.configs.clear()
+        harness.callTool.mockClear()
+    })
+
+    it('describes display_image as user output rather than image input', async () => {
+        await runHappyMcpStdioBridge([
+            '--url',
+            'http://127.0.0.1:43006',
+            '--tools',
+            'display_image'
+        ])
+
+        const description = harness.configs.get('display_image')?.description
+        expect(description).toContain('human user')
+        expect(description).toContain('does not provide image input to the model')
+        expect(description).toContain('cannot be used to read, inspect, or analyze image contents')
+    })
+
+    it('registers and forwards skill_lookup when the HTTP server enables it', async () => {
+        await runHappyMcpStdioBridge([
+            '--url',
+            'http://127.0.0.1:43006',
+            '--tools',
+            'change_title,display_image,display_video,display_media,skill_lookup'
+        ])
+
+        expect([...harness.tools.keys()]).toEqual([
+            'change_title',
+            'display_image',
+            'display_video',
+            'display_media',
+            'skill_lookup'
+        ])
+
+        const handler = harness.tools.get('skill_lookup')
+        expect(handler).toBeDefined()
+        await expect(handler?.({ name: 'review' })).resolves.toEqual({
+            content: [{ type: 'text', text: 'forwarded' }],
+            isError: false
+        })
+        expect(harness.callTool).toHaveBeenCalledWith({
+            name: 'skill_lookup',
+            arguments: { name: 'review' }
+        })
+    })
+
+    it('keeps skill_lookup hidden when the upstream HTTP server does not enable it', async () => {
+        await runHappyMcpStdioBridge([
+            '--url',
+            'http://127.0.0.1:43006',
+            '--tools',
+            'change_title,display_image,display_video'
+        ])
+
+        expect([...harness.tools.keys()]).toEqual(['change_title', 'display_image', 'display_video'])
+    })
+
+    it('forwards display_media arguments unchanged', async () => {
+        await runHappyMcpStdioBridge([
+            '--url',
+            'http://127.0.0.1:43006',
+            '--tools',
+            'display_media'
+        ])
+
+        const handler = harness.tools.get('display_media')
+        await expect(handler?.({ path: '/tmp/sample.wav', title: 'sample.wav' })).resolves.toEqual({
+            content: [{ type: 'text', text: 'forwarded' }],
+            isError: false
+        })
+        expect(harness.callTool).toHaveBeenCalledWith({
+            name: 'display_media',
+            arguments: { path: '/tmp/sample.wav', title: 'sample.wav' }
+        })
+    })
+
+    it('registers ping_peer when included in --tools', async () => {
+        await runHappyMcpStdioBridge([
+            '--url',
+            'http://127.0.0.1:43006',
+            '--tools',
+            'change_title,display_image,display_video,display_media,ping_peer'
+        ])
+
+        expect([...harness.tools.keys()]).toEqual([
+            'change_title',
+            'display_image',
+            'display_video',
+            'display_media',
+            'ping_peer'
+        ])
+    })
+
+    it.each(['auto', 'queue', 'steer'])('advertises and forwards ping_peer delivery mode %s', async (deliveryMode) => {
+        await runHappyMcpStdioBridge(['--url', 'http://127.0.0.1:43006', '--tools', 'ping_peer'])
+        const schema = harness.configs.get('ping_peer')?.inputSchema as {
+            parse(input: unknown): unknown
+        }
+        const args = { sessionIdPrefix: 'peer-id', message: 'hello', deliveryMode }
+        expect(harness.configs.get('ping_peer')?.description).toContain('auto (default)')
+        expect(schema.parse(args)).toEqual(args)
+        expect(() => schema.parse({ ...args, deliveryMode: 'interrupt' })).toThrow()
+        await harness.tools.get('ping_peer')?.(args)
+        expect(harness.callTool).toHaveBeenCalledWith({ name: 'ping_peer', arguments: args })
+    })
+
+    it('registers inspect_peer when included in --tools', async () => {
+        await runHappyMcpStdioBridge([
+            '--url',
+            'http://127.0.0.1:43006',
+            '--tools',
+            'change_title,display_image,display_video,display_media,ping_peer,inspect_peer'
+        ])
+
+        expect([...harness.tools.keys()]).toEqual([
+            'change_title',
+            'display_image',
+            'display_video',
+            'display_media',
+            'ping_peer',
+            'inspect_peer'
+        ])
+    })
+    it('registers spawn_peer when included in --tools', async () => {
+        await runHappyMcpStdioBridge([
+            '--url',
+            'http://127.0.0.1:43006',
+            '--tools',
+            'change_title,display_image,display_video,display_media,spawn_peer'
+        ])
+
+        expect([...harness.tools.keys()]).toEqual([
+            'change_title',
+            'display_image',
+            'display_video',
+            'display_media',
+            'spawn_peer'
+        ])
+    })
+
+    it('registers list_peers when included in --tools', async () => {
+        await runHappyMcpStdioBridge([
+            '--url',
+            'http://127.0.0.1:43006',
+            '--tools',
+            'change_title,display_image,display_video,display_media,list_peers,ping_peer,inspect_peer'
+        ])
+
+        expect([...harness.tools.keys()]).toEqual([
+            'change_title',
+            'display_image',
+            'display_video',
+            'display_media',
+            'ping_peer',
+            'inspect_peer',
+            'list_peers',
+        ])
+    })
+
+
+    it('hides peer tools under HAPI_DISABLE_PEER_TOOLS even when listed in --tools', async () => {
+        process.env.HAPI_DISABLE_PEER_TOOLS = '1'
+        try {
+            await runHappyMcpStdioBridge([
+                '--url',
+                'http://127.0.0.1:43006',
+                '--tools',
+                'change_title,list_peers,ping_peer,inspect_peer,spawn_peer'
+            ])
+
+            expect([...harness.tools.keys()]).toEqual(['change_title'])
+        } finally {
+            delete process.env.HAPI_DISABLE_PEER_TOOLS
+        }
+    })
+
+    it('drops peer tools from the default tool list under HAPI_DISABLE_PEER_TOOLS', async () => {
+        // No --tools: the bridge seeds its default list, which includes the
+        // peer tools. Positive control first so the disabled run below proves
+        // filtering rather than an empty seed.
+        await runHappyMcpStdioBridge(['--url', 'http://127.0.0.1:43006'])
+
+        expect([...harness.tools.keys()]).toEqual([
+            'change_title',
+            'display_image',
+            'display_video',
+            'display_media',
+            'ping_peer',
+            'spawn_peer',
+            'inspect_peer',
+            'list_peers'
+        ])
+
+        harness.tools.clear()
+        harness.configs.clear()
+
+        process.env.HAPI_DISABLE_PEER_TOOLS = '1'
+        try {
+            await runHappyMcpStdioBridge(['--url', 'http://127.0.0.1:43006'])
+
+            expect([...harness.tools.keys()]).toEqual([
+                'change_title',
+                'display_image',
+                'display_video',
+                'display_media'
+            ])
+        } finally {
+            delete process.env.HAPI_DISABLE_PEER_TOOLS
+        }
+    })
+})

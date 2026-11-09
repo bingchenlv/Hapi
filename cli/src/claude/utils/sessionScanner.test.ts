@@ -1,0 +1,317 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { createSessionScanner, readSessionLog } from './sessionScanner'
+import { RawJSONLines } from '../types'
+import { mkdir, writeFile, appendFile, rm, readFile, rename } from 'node:fs/promises'
+import { join } from 'node:path'
+import { tmpdir, homedir } from 'node:os'
+import { existsSync } from 'node:fs'
+import { getProjectPath } from './path'
+
+describe('sessionScanner', () => {
+  let testDir: string
+  let projectDir: string
+  let collectedMessages: RawJSONLines[]
+  let scanner: Awaited<ReturnType<typeof createSessionScanner>> | null = null
+  
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `scanner-test-${Date.now()}`)
+    await mkdir(testDir, { recursive: true })
+    
+    projectDir = getProjectPath(testDir)
+    await mkdir(projectDir, { recursive: true })
+    
+    collectedMessages = []
+  })
+  
+  afterEach(async () => {
+    // Clean up scanner
+    if (scanner) {
+      await scanner.cleanup()
+      scanner = null
+    }
+    
+    if (existsSync(testDir)) {
+      await rm(testDir, { recursive: true, force: true })
+    }
+    if (existsSync(projectDir)) {
+      await rm(projectDir, { recursive: true, force: true })
+    }
+  })
+  
+  it('should process initial session and resumed session correctly', async () => {
+    // TEST SCENARIO:
+    // Phase 1: User says "lol" → Assistant responds "lol" → Session closes
+    // Phase 2: User resumes with NEW session ID → User says "run ls tool" → Assistant runs LS tool → Shows files
+    // 
+    // Key point: When resuming, Claude creates a NEW session file with:
+    // - Summary line
+    // - Complete history from previous session (with NEW session ID)
+    // - New messages
+    scanner = await createSessionScanner({
+      sessionId: null,
+      workingDirectory: testDir,
+      onMessage: (msg) => collectedMessages.push(msg)
+    })
+    
+    // PHASE 1: Initial session (0-say-lol-session.jsonl)
+    const fixture1 = await readFile(join(__dirname, '__fixtures__', '0-say-lol-session.jsonl'), 'utf-8')
+    const lines1 = fixture1.split('\n').filter(line => line.trim())
+    
+    const sessionId1 = '93a9705e-bc6a-406d-8dce-8acc014dedbd'
+    const sessionFile1 = join(projectDir, `${sessionId1}.jsonl`)
+    
+    // Write first line
+    await writeFile(sessionFile1, lines1[0] + '\n')
+    scanner.onNewSession(sessionId1)
+    await new Promise(resolve => setTimeout(resolve, 100))
+    
+    expect(collectedMessages).toHaveLength(1)
+    expect(collectedMessages[0].type).toBe('user')
+    if (collectedMessages[0].type === 'user') {
+      const content = collectedMessages[0].message.content
+      const text = typeof content === 'string' ? content : (content as any)[0].text
+      expect(text).toBe('say lol')
+    }
+    
+    // Write second line with delay
+    await new Promise(resolve => setTimeout(resolve, 50))
+    await appendFile(sessionFile1, lines1[1] + '\n')
+    await new Promise(resolve => setTimeout(resolve, 200))
+    
+    expect(collectedMessages).toHaveLength(2)
+    expect(collectedMessages[1].type).toBe('assistant')
+    if (collectedMessages[1].type === 'assistant' && collectedMessages[1].message) {
+      expect((collectedMessages[1].message.content as any)[0].text).toBe('lol')
+    }
+    
+    // PHASE 2: Resumed session (1-continue-run-ls-tool.jsonl)
+    const fixture2 = await readFile(join(__dirname, '__fixtures__', '1-continue-run-ls-tool.jsonl'), 'utf-8')
+    const lines2 = fixture2.split('\n').filter(line => line.trim())
+    
+    const sessionId2 = '789e105f-ae33-486d-9271-0696266f072d'
+    const sessionFile2 = join(projectDir, `${sessionId2}.jsonl`)
+    
+    // Reset collected messages count for clarity
+    const phase1Count = collectedMessages.length
+    
+    // Write summary + historical messages (lines 0-2) - NOT line 3 which is new
+    let initialContent = ''
+    for (let i = 0; i <= 2; i++) {
+      initialContent += lines2[i] + '\n'
+    }
+    await writeFile(sessionFile2, initialContent)
+    
+    scanner.onNewSession(sessionId2)
+    await new Promise(resolve => setTimeout(resolve, 100))
+    
+    // Should have added only 1 new message (summary) 
+    // The historical user + assistant messages (lines 1-2) are deduplicated because they have same UUIDs
+    expect(collectedMessages).toHaveLength(phase1Count + 1)
+    expect(collectedMessages[phase1Count].type).toBe('summary')
+    
+    // Write new messages (user asks for ls tool) - this is line 3
+    await new Promise(resolve => setTimeout(resolve, 50))
+    await appendFile(sessionFile2, lines2[3] + '\n')
+    await new Promise(resolve => setTimeout(resolve, 200))
+    
+    // Find the user message we just added
+    const userMessages = collectedMessages.filter(m => m.type === 'user')
+    const lastUserMsg = userMessages[userMessages.length - 1]
+    expect(lastUserMsg).toBeDefined()
+    if (lastUserMsg && lastUserMsg.type === 'user') {
+      expect(lastUserMsg.message.content).toBe('run ls tool ')
+    }
+    
+    // Write remaining lines (assistant tool use, tool result, final assistant message) - starting from line 4
+    for (let i = 4; i < lines2.length; i++) {
+      await new Promise(resolve => setTimeout(resolve, 50))
+      await appendFile(sessionFile2, lines2[i] + '\n')
+    }
+    await new Promise(resolve => setTimeout(resolve, 300))
+    
+    // Final count check
+    const finalMessages = collectedMessages.slice(phase1Count)
+    
+    // Should have: 1 summary + 0 history (deduplicated) + 4 new messages = 5 total for session 2
+    expect(finalMessages.length).toBeGreaterThanOrEqual(5)
+    
+    // Verify last message is assistant with the file listing
+    const lastAssistantMsg = collectedMessages[collectedMessages.length - 1]
+    expect(lastAssistantMsg.type).toBe('assistant')
+    if (lastAssistantMsg.type === 'assistant' && lastAssistantMsg.message?.content) {
+      const content = (lastAssistantMsg.message.content as any)[0].text
+      expect(content).toContain('0-say-lol-session.jsonl')
+      expect(content).toContain('readme.md')
+    }
+  })
+
+  it('reads only new bytes on a subsequent scan (incremental, no reparse of prior region)', async () => {
+    const filePath = join(testDir, 'incremental.jsonl')
+    const line1 = JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'first' } })
+    const line2 = JSON.stringify({ type: 'user', uuid: 'u2', message: { content: 'second' } })
+    await writeFile(filePath, line1 + '\n')
+
+    const first = await readSessionLog(filePath, 0)
+    expect(first.events).toHaveLength(1)
+    expect(first.nextCursor).toBe(Buffer.byteLength(line1 + '\n'))
+
+    await appendFile(filePath, line2 + '\n')
+    const second = await readSessionLog(filePath, first.nextCursor)
+
+    // Starting from the cursor returned by the first scan, only the newly
+    // appended line comes back — the already-seen line is not re-parsed.
+    expect(second.events).toHaveLength(1)
+    expect(second.events[0].event.type).toBe('user')
+    if (second.events[0].event.type === 'user') {
+      expect(second.events[0].event.uuid).toBe('u2')
+    }
+    expect(second.nextCursor).toBe(Buffer.byteLength(line1 + '\n' + line2 + '\n'))
+  })
+
+  it('holds back an unterminated trailing line until its newline arrives', async () => {
+    const filePath = join(testDir, 'partial.jsonl')
+    const complete = JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'complete' } })
+    const partial = JSON.stringify({ type: 'user', uuid: 'u2', message: { content: 'partial' } })
+
+    // Simulate a write in progress: a full line followed by a truncated one
+    // with no trailing newline yet.
+    await writeFile(filePath, complete + '\n' + partial.slice(0, 10))
+
+    const result = await readSessionLog(filePath, 0)
+    expect(result.events).toHaveLength(1)
+    if (result.events[0].event.type === 'user') {
+      expect(result.events[0].event.uuid).toBe('u1')
+    }
+    // Cursor sits right after the complete line's newline, not at EOF — the
+    // partial trailing bytes are left unconsumed.
+    expect(result.nextCursor).toBe(Buffer.byteLength(complete + '\n'))
+
+    // Completing the line makes it available on the next scan.
+    await appendFile(filePath, partial.slice(10) + '\n')
+    const followUp = await readSessionLog(filePath, result.nextCursor)
+    expect(followUp.events).toHaveLength(1)
+    if (followUp.events[0].event.type === 'user') {
+      expect(followUp.events[0].event.uuid).toBe('u2')
+    }
+  })
+
+  it('forwards a complete final record written without a trailing newline', async () => {
+    const filePath = join(testDir, 'no-trailing-newline.jsonl')
+    const line1 = JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'first' } })
+    const line2 = JSON.stringify({ type: 'user', uuid: 'u2', message: { content: 'last' } })
+
+    // A prior line terminated by a newline, then a complete final record that
+    // was flushed without its terminating newline (shutdown/import).
+    await writeFile(filePath, line1 + '\n' + line2)
+
+    const result = await readSessionLog(filePath, 0)
+    expect(result.events).toHaveLength(2)
+    expect(result.events.map((e) => e.event.type === 'user' ? e.event.uuid : null)).toEqual(['u1', 'u2'])
+    // The whole file is consumed even though it does not end in a newline.
+    expect(result.nextCursor).toBe(Buffer.byteLength(line1 + '\n' + line2))
+  })
+
+  it('forwards a Claude API error record with null usage fields and keeps its error flags (#1857)', async () => {
+    const filePath = join(testDir, 'api-error.jsonl')
+    const line = JSON.stringify({
+      type: 'assistant',
+      uuid: 'a1',
+      isSidechain: false,
+      isApiErrorMessage: true,
+      error: 'invalid_request',
+      message: {
+        model: '<synthetic>',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Prompt is too long' }],
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+          service_tier: null,
+          inference_geo: null,
+          speed: null
+        }
+      }
+    })
+    await writeFile(filePath, line + '\n')
+
+    const result = await readSessionLog(filePath, 0)
+    expect(result.events).toHaveLength(1)
+    expect(result.events[0].event).toMatchObject({
+      type: 'assistant',
+      uuid: 'a1',
+      isApiErrorMessage: true,
+      error: 'invalid_request'
+    })
+  })
+
+  it('forwards a single complete record with no newline at all', async () => {
+    const filePath = join(testDir, 'single-no-newline.jsonl')
+    const only = JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'only' } })
+    await writeFile(filePath, only)
+
+    const result = await readSessionLog(filePath, 0)
+    expect(result.events).toHaveLength(1)
+    if (result.events[0].event.type === 'user') {
+      expect(result.events[0].event.uuid).toBe('u1')
+    }
+    expect(result.nextCursor).toBe(Buffer.byteLength(only))
+  })
+  it('forwards Claude Code 2.x subagent transcripts tagged with the spawning tool_use id', async () => {
+    const sessionId = 'c0ffee00-0000-4000-8000-000000000001'
+    const subagentDir = join(projectDir, sessionId, 'subagents')
+    await mkdir(subagentDir, { recursive: true })
+    // Already on disk when the scanner starts → treated as seen, like the main log.
+    await writeFile(join(subagentDir, 'agent-old.jsonl'), JSON.stringify({ type: 'user', uuid: 'old', isSidechain: true, parentUuid: null, message: { content: 'old prompt' } }) + '\n')
+    await writeFile(join(projectDir, `${sessionId}.jsonl`), '')
+
+    scanner = await createSessionScanner({
+      sessionId,
+      workingDirectory: testDir,
+      onMessage: (msg) => collectedMessages.push(msg)
+    })
+
+    await writeFile(join(subagentDir, 'agent-a1.meta.json'), JSON.stringify({ agentType: 'general-purpose', toolUseId: 'toolu_parent' }))
+    await writeFile(join(subagentDir, 'agent-a1.jsonl'), [
+      { type: 'user', uuid: 's1', isSidechain: true, parentUuid: null, message: { role: 'user', content: 'sub prompt' } },
+      { type: 'assistant', uuid: 's2', isSidechain: true, parentUuid: 's1', message: { role: 'assistant', content: [{ type: 'text', text: 'sub reply' }] } }
+    ].map((line) => JSON.stringify(line)).join('\n') + '\n')
+    await new Promise(resolve => setTimeout(resolve, 3500))
+
+    expect(collectedMessages.map((m) => m.type === 'user' || m.type === 'assistant' ? [m.uuid, m.parentToolUseId] : null)).toEqual([
+      ['s1', 'toolu_parent'],
+      ['s2', 'toolu_parent']
+    ])
+  })
+
+  it('follows the transcript when Claude Code relocates it into and out of a worktree project dir (#1950)', async () => {
+    const sessionId = 'c0ffee00-0000-4000-8000-000000001950'
+    const line = (uuid: string) => JSON.stringify({ type: 'user', uuid, parentUuid: null, message: { role: 'user', content: uuid } }) + '\n'
+    const mainFile = join(projectDir, `${sessionId}.jsonl`)
+    const worktreeDir = getProjectPath(join(testDir, '.claude', 'worktrees', 'wt'))
+    const worktreeFile = join(worktreeDir, `${sessionId}.jsonl`)
+    await mkdir(worktreeDir, { recursive: true })
+    try {
+      await writeFile(mainFile, line('before'))
+      scanner = await createSessionScanner({
+        sessionId: null,
+        workingDirectory: testDir,
+        onMessage: (msg) => collectedMessages.push(msg)
+      })
+      scanner.onNewSession(sessionId)
+      const uuids = () => collectedMessages.map((m) => m.type === 'user' ? m.uuid : null)
+      await vi.waitFor(() => expect(uuids()).toEqual(['before']), { timeout: 10000 })
+
+      await rename(mainFile, worktreeFile)
+      await appendFile(worktreeFile, line('inside'))
+      await vi.waitFor(() => expect(uuids()).toEqual(['before', 'inside']), { timeout: 10000 })
+
+      await rename(worktreeFile, mainFile)
+      await appendFile(mainFile, line('after'))
+      await vi.waitFor(() => expect(uuids()).toEqual(['before', 'inside', 'after']), { timeout: 10000 })
+    } finally {
+      await rm(worktreeDir, { recursive: true, force: true })
+    }
+  }, 30000)
+})

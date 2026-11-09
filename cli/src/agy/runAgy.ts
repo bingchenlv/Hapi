@@ -1,0 +1,196 @@
+import { randomUUID } from 'node:crypto';
+import { logger } from '@/ui/logger';
+import { agyLoop } from './loop';
+import { MessageQueue2 } from '@/utils/MessageQueue2';
+import { hashObject } from '@/utils/deterministicJson';
+import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler';
+import type { AgentState } from '@/api/types';
+import type { AgyMode, PermissionMode } from './types';
+import { bootstrapExistingSession, bootstrapSession } from '@/agent/sessionFactory';
+import { registerLocalHandoffHandler } from '@/agent/localHandoff';
+import { createModeChangeHandler, createRunnerLifecycle } from '@/agent/runnerLifecycle';
+import { registerSessionConfigRpc } from '@/agent/sessionConfigRpc';
+import { formatMessageWithAttachments } from '@/utils/attachmentFormatter';
+import { getInvokedCwd } from '@/utils/invokedCwd';
+import type { SessionEffort, SessionModel } from '@/api/types';
+import { splitAgyModelSelection } from '@hapi/protocol';
+import { listAgyModels } from '@/modules/common/agyModels';
+import { normalizeAgyModelSelection } from './utils/agyModelSelection';
+
+export async function runAgy(opts: {
+    startedBy?: 'runner' | 'terminal';
+    startingMode?: 'local' | 'remote';
+    permissionMode?: PermissionMode;
+    model?: string;
+    effort?: string;
+    resumeSessionId?: string;
+    existingSessionId?: string;
+    /** Fresh machine-spawn stub (`--hapi-session-id`); adopt via bootstrapSession. */
+    reservedSessionId?: string;
+    workingDirectory?: string;
+} = {}): Promise<void> {
+    const workingDirectory = opts.workingDirectory ?? getInvokedCwd();
+    const startedBy = opts.startedBy ?? 'terminal';
+
+    logger.debug(`[agy] Starting with options: startedBy=${startedBy}, startingMode=${opts.startingMode}`);
+
+    // agy is headless-only: the web is the primary surface, so sessions always
+    // start in remote mode (no PTY, no local TUI mode).
+    const startingMode: 'local' | 'remote' = opts.startingMode ?? 'remote';
+
+    const initialState: AgentState = {
+        controlledByUser: false,
+        startingMode
+    };
+
+    const initialModel = opts.model ?? null;
+
+    const bootstrap = opts.existingSessionId
+        ? await bootstrapExistingSession({
+            sessionId: opts.existingSessionId,
+            flavor: 'agy',
+            startedBy,
+            workingDirectory
+        })
+        : await bootstrapSession({
+            flavor: 'agy',
+            startedBy,
+            workingDirectory,
+            tag: `__hapi_agy_${randomUUID()}`,
+            agentState: initialState,
+            model: initialModel ?? undefined,
+            effort: opts.effort,
+            reservedSessionId: opts.reservedSessionId
+        });
+    const { api, session } = bootstrap;
+
+    const messageQueue = new MessageQueue2<AgyMode>((mode) => hashObject({
+        permissionMode: mode.permissionMode,
+        model: mode.model,
+        effort: mode.effort,
+    }));
+
+    let currentPermissionMode: PermissionMode = opts.permissionMode ?? 'request-review';
+    let sessionModel: SessionModel = initialModel;
+    let sessionEffort: SessionEffort = opts.effort ?? null;
+
+    const sessionWrapperRef: { current: any | null } = { current: null };
+
+    const lifecycle = createRunnerLifecycle({
+        session,
+        logTag: 'agy',
+        stopKeepAlive: () => sessionWrapperRef.current?.stopKeepAlive(),
+        onBeforeClose: () => sessionWrapperRef.current?.kill(),
+        onAfterClose: () => undefined,
+    });
+
+    lifecycle.registerProcessHandlers();
+    registerKillSessionHandler(session.rpcHandlerManager, lifecycle.cleanupAndExit, session);
+    registerLocalHandoffHandler(session.rpcHandlerManager, lifecycle);
+
+    let crashed = false;
+
+    try {
+        // Bootstrap must report to the runner before a potentially slow catalog
+        // probe. ApiSessionClient buffers early messages until onUserMessage is
+        // registered below, after the launch selection has been normalized.
+        const initialized = (async () => {
+            const catalog = splitAgyModelSelection(initialModel).model
+                ? await listAgyModels()
+                : undefined;
+            const selection = normalizeAgyModelSelection(initialModel, opts.effort, catalog?.availableModels ?? []);
+            sessionModel = selection.model;
+            sessionEffort = selection.effort;
+        })();
+
+        const syncSessionMode = () => {
+            const sessionInstance = sessionWrapperRef.current;
+            if (!sessionInstance) return;
+            sessionInstance.setPermissionMode(currentPermissionMode);
+            sessionInstance.setModel(sessionModel);
+            sessionInstance.setEffort(sessionEffort);
+            sessionInstance.pushKeepAlive();
+            logger.debug(`[agy] Synced session config: permissionMode=${currentPermissionMode}, model=${sessionModel ?? '(default)'}`);
+        };
+
+        session.onCancelQueuedMessage((localId) => {
+            const removed = messageQueue.cancelByLocalId(localId);
+            logger.debug(`[agy] cancelByLocalId(${localId}): ${removed ? 'removed' : 'not found'}`);
+            return removed;
+        });
+        session.onRetryQueuedMessage((localId) => messageQueue.releaseIndeterminateReservation(localId));
+
+        registerSessionConfigRpc<PermissionMode>({
+            rpcHandlerManager: session.rpcHandlerManager,
+            flavor: 'agy',
+            modelMode: 'nullable',
+            effortMode: 'nullable',
+            onApply: async (config) => {
+                // A config request received during startup must apply after the
+                // initial selection, rather than be overwritten when probing ends.
+                await initialized;
+                let selection;
+                if (config.model !== undefined || config.effort !== undefined) {
+                    const models = await listAgyModels();
+                    const model = config.model === undefined ? sessionModel : config.model;
+                    const effort = config.effort !== undefined
+                        ? config.effort
+                        : config.model !== undefined && splitAgyModelSelection(model).effort
+                            ? undefined
+                            : sessionEffort;
+                    selection = normalizeAgyModelSelection(model, effort, models.availableModels ?? []);
+                }
+                if (config.permissionMode !== undefined) {
+                    currentPermissionMode = config.permissionMode;
+                }
+                if (selection) {
+                    sessionModel = selection.model;
+                    sessionEffort = selection.effort;
+                }
+                return selection;
+            },
+            onAfterApply: syncSessionMode
+        });
+
+        await initialized;
+
+        session.onUserMessage((message, localId) => {
+            const formattedText = formatMessageWithAttachments(message.content.text, message.content.attachments);
+            // Snapshot config when buffered/new messages enter the queue, so a
+            // later model or effort switch cannot change an already queued turn.
+            const mode: AgyMode = {
+                permissionMode: currentPermissionMode,
+                model: sessionModel,
+                effort: sessionEffort,
+            };
+            messageQueue.push(formattedText, mode, localId);
+        });
+
+        await agyLoop({
+            path: workingDirectory,
+            startingMode,
+            startedBy,
+            messageQueue,
+            session,
+            api,
+            permissionMode: currentPermissionMode,
+            model: sessionModel ?? undefined,
+            effort: sessionEffort,
+            resumeSessionId: opts.resumeSessionId,
+            onModeChange: createModeChangeHandler(session),
+            onSessionReady: (instance) => {
+                sessionWrapperRef.current = instance;
+                syncSessionMode();
+            }
+        });
+    } catch (error) {
+        crashed = true;
+        lifecycle.markCrash(error);
+        logger.debug('[agy] Loop error:', error);
+    } finally {
+        if (!crashed) {
+            lifecycle.setSessionEndReason('completed');
+        }
+        await lifecycle.cleanupAndExit();
+    }
+}

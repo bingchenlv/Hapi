@@ -1,0 +1,276 @@
+import { z } from 'zod'
+
+/**
+ * @description The legacy payload type identifier used for all generic agent messages.
+ * Changing this value will affect the communication schema between CLI, Hub, and Web.
+ * A migration plan is required if this literal is ever modified.
+ */
+export const AGENT_MESSAGE_PAYLOAD_TYPE = 'codex' as const
+
+export const AGENT_FLAVORS = ['agy', 'claude', 'codex', 'dsh', 'copilot', 'cursor', 'gemini', 'grok', 'kimi', 'opencode', 'pi'] as const
+export type AgentFlavor = typeof AGENT_FLAVORS[number]
+export const AgentFlavorSchema = z.enum(AGENT_FLAVORS)
+
+// Flavors offered when CREATING a new session. Gemini CLI is intentionally
+// excluded: Google sunset the consumer Gemini CLI (2026-06-18) so it can no
+// longer be launched. It is kept in AGENT_FLAVORS / AgentFlavorSchema above so
+// existing stored Gemini sessions still validate and remain viewable.
+export const CREATABLE_AGENT_FLAVORS: readonly AgentFlavor[] = AGENT_FLAVORS.filter(
+    (flavor) => flavor !== 'gemini'
+)
+
+export const AGY_PERMISSION_MODES = ['request-review', 'acceptEdits', 'plan', 'always-proceed'] as const
+export type AgyPermissionMode = typeof AGY_PERMISSION_MODES[number]
+
+export const CLAUDE_PERMISSION_MODES = ['default', 'acceptEdits', 'auto', 'bypassPermissions', 'plan'] as const
+export type ClaudePermissionMode = typeof CLAUDE_PERMISSION_MODES[number]
+
+export const CODEX_PERMISSION_MODES = ['default', 'read-only', 'autoReview', 'yolo'] as const
+export type CodexPermissionMode = typeof CODEX_PERMISSION_MODES[number]
+
+export const CODEX_COLLABORATION_MODES = ['default', 'plan'] as const
+export type CodexCollaborationMode = typeof CODEX_COLLABORATION_MODES[number]
+
+export const GEMINI_PERMISSION_MODES = ['default', 'read-only', 'safe-yolo', 'yolo'] as const
+export type GeminiPermissionMode = typeof GEMINI_PERMISSION_MODES[number]
+
+export const KIMI_PERMISSION_MODES = ['default', 'read-only', 'safe-yolo', 'yolo'] as const
+export type KimiPermissionMode = typeof KIMI_PERMISSION_MODES[number]
+
+export const COPILOT_PERMISSION_MODES = ['default', 'read-only', 'safe-yolo', 'yolo'] as const
+export type CopilotPermissionMode = typeof COPILOT_PERMISSION_MODES[number]
+
+export const GROK_PERMISSION_MODES = ['default', 'auto', 'plan', 'bypassPermissions'] as const
+export type GrokPermissionMode = typeof GROK_PERMISSION_MODES[number]
+
+export const OPENCODE_PERMISSION_MODES = ['default', 'plan', 'yolo'] as const
+export type OpencodePermissionMode = typeof OPENCODE_PERMISSION_MODES[number]
+
+export const CURSOR_PERMISSION_MODES = ['default', 'plan', 'ask', 'debug', 'autoReview', 'yolo'] as const
+export type CursorPermissionMode = typeof CURSOR_PERMISSION_MODES[number]
+
+export const PERMISSION_MODES = [
+    'default',
+    'acceptEdits',
+    'auto',
+    'bypassPermissions',
+    'plan',
+    'ask',
+    'debug',
+    'autoReview',
+    'read-only',
+    'safe-yolo',
+    'yolo',
+    'request-review',
+    'always-proceed'
+] as const
+export type PermissionMode = typeof PERMISSION_MODES[number]
+
+
+export const PERMISSION_MODE_LABELS: Record<PermissionMode, string> = {
+    default: 'Default',
+    acceptEdits: 'Accept Edits',
+    auto: 'Auto',
+    plan: 'Plan Mode',
+    ask: 'Ask Mode',
+    debug: 'Debug Mode',
+    autoReview: 'Auto',
+    bypassPermissions: 'Yolo',
+    'read-only': 'Read Only',
+    'safe-yolo': 'Safe Yolo',
+    yolo: 'Yolo',
+    'request-review': 'Request Review',
+    'always-proceed': 'Always Proceed'
+}
+
+export type PermissionModeTone = 'neutral' | 'info' | 'warning' | 'danger'
+
+export const PERMISSION_MODE_TONES: Record<PermissionMode, PermissionModeTone> = {
+    default: 'neutral',
+    acceptEdits: 'warning',
+    auto: 'warning',
+    plan: 'info',
+    ask: 'info',
+    debug: 'info',
+    autoReview: 'warning',
+    bypassPermissions: 'danger',
+    'read-only': 'warning',
+    'safe-yolo': 'warning',
+    yolo: 'danger',
+    'request-review': 'neutral',
+    'always-proceed': 'danger'
+}
+
+export type PermissionModeOption = {
+    mode: PermissionMode
+    label: string
+    tone: PermissionModeTone
+}
+
+export type CodexCollaborationModeOption = {
+    mode: CodexCollaborationMode
+    label: string
+}
+
+export const CODEX_COLLABORATION_MODE_LABELS: Record<CodexCollaborationMode, string> = {
+    default: 'Default',
+    plan: 'Plan'
+}
+
+export function getPermissionModeLabel(mode: PermissionMode): string {
+    return PERMISSION_MODE_LABELS[mode]
+}
+
+export function getPermissionModeTone(mode: PermissionMode): PermissionModeTone {
+    return PERMISSION_MODE_TONES[mode]
+}
+
+export function getCodexCollaborationModeLabel(mode: CodexCollaborationMode): string {
+    return CODEX_COLLABORATION_MODE_LABELS[mode]
+}
+
+export function getPermissionModesForFlavor(flavor?: string | null): readonly PermissionMode[] {
+    if (flavor === 'codex') {
+        return CODEX_PERMISSION_MODES
+    }
+    if (flavor === 'gemini') {
+        return GEMINI_PERMISSION_MODES
+    }
+    if (flavor === 'kimi') {
+        return KIMI_PERMISSION_MODES
+    }
+    if (flavor === 'dsh') {
+        return []
+    }
+    if (flavor === 'copilot') {
+        return COPILOT_PERMISSION_MODES
+    }
+    if (flavor === 'grok') {
+        return GROK_PERMISSION_MODES
+    }
+    if (flavor === 'opencode') {
+        return OPENCODE_PERMISSION_MODES
+    }
+    if (flavor === 'agy') {
+        return AGY_PERMISSION_MODES
+    }
+    if (flavor === 'cursor') {
+        return CURSOR_PERMISSION_MODES
+    }
+    if (flavor === 'pi') {
+        // Pi RPC mode has no runtime permission switching (always auto-approve);
+        // no permission modes are offered.
+        return []
+    }
+    return CLAUDE_PERMISSION_MODES
+}
+
+export function getPermissionModeOptionsForFlavor(flavor?: string | null): PermissionModeOption[] {
+    return getPermissionModesForFlavor(flavor).map((mode) => ({
+        mode,
+        label: getPermissionModeLabel(mode),
+        tone: getPermissionModeTone(mode)
+    }))
+}
+
+export function isPermissionModeAllowedForFlavor(mode: PermissionMode, flavor?: string | null): boolean {
+    return getPermissionModesForFlavor(flavor).includes(mode)
+}
+
+export function getCodexCollaborationModeOptions(): CodexCollaborationModeOption[] {
+    return CODEX_COLLABORATION_MODES.map((mode) => ({
+        mode,
+        label: getCodexCollaborationModeLabel(mode)
+    }))
+}
+
+type SteeringSessionMetadata = {
+    flavor?: string | null
+    cursorSessionId?: string | null
+    cursorSessionProtocol?: 'acp' | 'stream-json' | null
+    agyProtocol?: 'acp' | null
+}
+
+type SteeringSessionState = {
+    metadata?: SteeringSessionMetadata | null
+    thinking?: boolean
+    agentState?: { steeringActive?: boolean | null } | null
+}
+
+type SteeringCapability = {
+    activeTurnState: 'thinking' | 'steeringActive'
+    supportsSession?: (metadata: SteeringSessionMetadata) => boolean
+}
+
+/**
+ * Flavors that can deliver a queued message into an active turn on demand
+ * (per-message "Steer" from the waiting queue), without waiting for full-turn end.
+ *
+ * Steer = soft mid-turn delivery (same idea as Cursor GUI default "Send"):
+ * - Pi: native steer over the Pi runtime (first-class since #1466)
+ * - Codex: app-server `turn/steer` (true mid-turn inject)
+ * - OpenCode v1: concurrent ACP `session/prompt`; v2: durable REST inbox
+ *   steering at a native step boundary. Both require live steeringActive.
+ * - Cursor ACP: concurrent `session/prompt` soft-send (no cancel). Legacy
+ *   stream-json Cursor sessions are NOT steerable — gate with
+ *   {@link isSteeringSupportedForSession}.
+ * - Claude: stream-json stdin write during the turn (TUI Ctrl+X Ctrl+S);
+ *   Claude folds it in at the next tool boundary. Remote mode only.
+ * - Antigravity: concurrent ACP `session/prompt` (`agy acp`); agy answers the
+ *   interrupted request at once and folds the steer in after any running
+ *   tool call finishes. Only sessions marked `agyProtocol: 'acp'` steer.
+ *
+ * Others: not supported — UI hides Steer.
+ */
+export const STEERING_SUPPORTED_FLAVORS = ['agy', 'claude', 'codex', 'cursor', 'opencode', 'pi'] as const
+
+type SteeringFlavor = typeof STEERING_SUPPORTED_FLAVORS[number]
+
+// Keep protocol restrictions and the runtime's active-turn signal together so
+// peer senders and the waiting queue do not need their own flavor branches.
+const STEERING_CAPABILITIES = {
+    agy: {
+        activeTurnState: 'steeringActive',
+        supportsSession: (metadata: SteeringSessionMetadata) => metadata.agyProtocol === 'acp'
+    },
+    claude: { activeTurnState: 'steeringActive' },
+    codex: { activeTurnState: 'steeringActive' },
+    cursor: {
+        activeTurnState: 'steeringActive',
+        supportsSession: (metadata: SteeringSessionMetadata) =>
+            metadata.cursorSessionProtocol !== 'stream-json'
+            && (Boolean(metadata.cursorSessionProtocol) || !metadata.cursorSessionId)
+    },
+    opencode: { activeTurnState: 'steeringActive' },
+    pi: { activeTurnState: 'thinking' }
+} satisfies Record<SteeringFlavor, SteeringCapability>
+
+function getSteeringCapability(flavor?: string | null): SteeringCapability | undefined {
+    if (!flavor || !Object.hasOwn(STEERING_CAPABILITIES, flavor)) return undefined
+    return STEERING_CAPABILITIES[flavor as SteeringFlavor]
+}
+
+export function isSteeringSupportedForFlavor(flavor?: string | null): boolean {
+    return getSteeringCapability(flavor) !== undefined
+}
+
+/**
+ * Session-aware steer gate. Legacy Cursor stream-json sessions advertise
+ * flavor `cursor` but cannot steer, including pre-ACP sessions with only an id.
+ * Native admission and remote-control checks remain the caller's responsibility.
+ */
+export function isSteeringSupportedForSession(metadata?: SteeringSessionMetadata | null): boolean {
+    const capability = getSteeringCapability(metadata?.flavor)
+    return capability !== undefined && (capability.supportsSession?.(metadata ?? {}) ?? true)
+}
+
+/**
+ * Whether the provider reports an active steerable turn. This does not imply
+ * that the session is active, remotely controlled, or will accept a native steer.
+ */
+export function hasActiveSteeringTurn(session: SteeringSessionState): boolean {
+    if (!isSteeringSupportedForSession(session.metadata)) return false
+    return getSteeringCapability(session.metadata?.flavor)?.activeTurnState === 'thinking'
+        ? session.thinking === true
+        : session.agentState?.steeringActive === true
+}

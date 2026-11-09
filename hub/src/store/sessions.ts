@@ -1,0 +1,962 @@
+import type { Database } from 'bun:sqlite'
+import { prepareCached } from './statementCache'
+import { bumpSessionDeletionEpoch } from './sessionInvalidation'
+import { randomUUID } from 'node:crypto'
+import { preserveSessionTitle } from './sessionTitleLock'
+
+import type { StoredSession, VersionedUpdateResult } from './types'
+import { safeJsonParse } from './json'
+import { updateVersionedField } from './versionedUpdates'
+import { removeMessageContentSearchForSession } from './messageContentSearch'
+
+function runInTransaction<T>(db: Database, operation: () => T): T {
+    return db.inTransaction ? operation() : db.transaction(operation)()
+}
+
+// Carry-forward fields that the hub preserves across any metadata
+// replacement when the incoming write omits them.
+//
+// The CLI's archive transition (cli/src/agent/runnerLifecycle.ts
+// archiveAndClose) spreads `currentMetadata` from the session client's
+// local cache; if that cache is `null` (e.g. the row's metadata failed
+// Zod parse at bootstrap and got nulled out in cli/src/api/api.ts) or
+// stale, the resulting payload is sparse and the unconditional REPLACE
+// in updateSessionMetadata wipes whatever it omits. That breaks resume
+// even though the on-disk chat data still exists.
+//
+// Three preservation tiers cover the failure modes:
+//
+//   - PARSE_IDENTITY_FIELDS: required by MetadataSchema in
+//     shared/src/schemas.ts. Without these, hub session cache and CLI
+//     getSession reject the row with safeParse → metadata becomes null
+//     downstream and resume cannot find a path even when the resume
+//     token survived.
+//
+//   - ROUTING_FIELDS: flavor + machineId. `flavor` is what
+//     hub/src/web/routes/sessions.ts and hub/src/sync/syncEngine.ts use
+//     to pick which session id field to read; if it's dropped, the
+//     `?? 'claude'` fallback misroutes a Cursor/Codex/Gemini session as
+//     Claude and the preserved token is ignored. `machineId` is the
+//     filter the CLI's resumable listing uses to scope rows to the
+//     current host; without it the row drops out of the resume picker.
+//
+//   - SIMPLE_RESUME_TOKENS: flavor-specific resume identifiers that are
+//     write-once-keep semantics. Mirror of pickExistingSessionMetadata
+//     in cli/src/agent/sessionFactory.ts.
+//
+// `cursorSessionProtocol` is paired with `cursorSessionId`: protocol is
+// tied to a specific chat id, so a write that explicitly sets a new
+// `cursorSessionId` must drop a stale prior protocol. Handled in
+// preserveCursorProtocolPair below.
+//
+// Explicit-clear sentinel: when `next` sets a carry-forward field to
+// `null`, the merge drops the key entirely from the output (the
+// resulting blob has neither the prior value nor `null`). This lets
+// callers intentionally remove a preserved field — e.g.
+// `cli/src/codex/session.ts` `resetCodexThread()` clears the codex
+// thread id with `codexSessionId: null` so a `/clear` command actually
+// drops the persisted thread. `undefined` (key missing from `next`)
+// continues to mean "carry forward".
+const PARSE_IDENTITY_FIELDS = ['path', 'host'] as const
+
+const ROUTING_FIELDS = ['flavor', 'machineId'] as const
+
+const SIMPLE_RESUME_TOKENS = [
+    'claudeSessionId',
+    'codexSessionId',
+    'geminiSessionId',
+    'opencodeSessionId',
+    'grokSessionId',
+    'cursorSessionId',
+    'kimiSessionId',
+    'copilotSessionId',
+    'piSessionId',
+    'dshSessionId'
+] as const
+
+// Hub-owned metadata that must survive sparse CLI metadata replacements.
+// `null` remains the explicit-clear sentinel handled by carryForwardIfMissing.
+const HUB_OWNED_METADATA_FIELDS = [
+    'codexArchivedFork',
+    'codexResumePending',
+    'titleSuggestionAutoAttemptedAt',
+    'titleSuggestionTurn',
+    'promptTitle'
+] as const
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function carryForwardIfMissing(
+    prior: Record<string, unknown>,
+    next: Record<string, unknown>,
+    merged: Record<string, unknown> | null,
+    fields: ReadonlyArray<string>
+): Record<string, unknown> | null {
+    let result = merged
+    for (const field of fields) {
+        // Explicit-clear sentinel: `null` in next means "drop this field".
+        // Strip it from the merged output so the persisted blob stays
+        // schema-clean (MetadataSchema fields are `string().optional()`
+        // — string|undefined, not nullable).
+        if (next[field] === null) {
+            if (result === null) {
+                result = { ...next }
+            }
+            delete result[field]
+            continue
+        }
+        if (next[field] === undefined && prior[field] !== undefined) {
+            if (result === null) {
+                result = { ...next }
+            }
+            result[field] = prior[field]
+        }
+    }
+    return result
+}
+
+function preserveCursorProtocolPair(
+    prior: Record<string, unknown>,
+    next: Record<string, unknown>,
+    merged: Record<string, unknown> | null
+): Record<string, unknown> | null {
+    // If next explicitly sets cursorSessionId, the protocol is tied to
+    // the new id — never carry over the prior protocol. The next write
+    // can include its own cursorSessionProtocol if it knows the protocol.
+    if (next.cursorSessionId !== undefined) {
+        return merged
+    }
+    // Otherwise next is silent on the id (and possibly the protocol);
+    // carry over the prior protocol so it stays paired with the prior id
+    // (which is preserved via SIMPLE_RESUME_TOKENS above).
+    if (next.cursorSessionProtocol === undefined && prior.cursorSessionProtocol !== undefined) {
+        const result = merged ?? { ...next }
+        result.cursorSessionProtocol = prior.cursorSessionProtocol
+        return result
+    }
+    return merged
+}
+
+function preserveForkSummary(
+    prior: Record<string, unknown>,
+    next: Record<string, unknown>,
+    merged: Record<string, unknown> | null
+): Record<string, unknown> | null {
+    // A fork's provisional title is Hub-generated. CLI bootstrap writes are
+    // sparse and historically drop it, leaving the child titled by its path.
+    // Explicit `summary: null` or a replacement summary still wins.
+    if (next.summary !== undefined) return merged
+    const summary = prior.summary
+    if (!isPlainObject(summary) || typeof summary.text !== 'string' || !summary.text.startsWith('Fork: ')) {
+        return merged
+    }
+    const result = merged ?? { ...next }
+    result.summary = summary
+    return result
+}
+
+export function mergeSessionMetadata(prior: unknown, next: unknown): unknown {
+    if (!isPlainObject(prior) || !isPlainObject(next)) {
+        return next
+    }
+    let merged: Record<string, unknown> | null = null
+    merged = carryForwardIfMissing(prior, next, merged, PARSE_IDENTITY_FIELDS)
+    merged = carryForwardIfMissing(prior, next, merged, ROUTING_FIELDS)
+    merged = carryForwardIfMissing(prior, next, merged, SIMPLE_RESUME_TOKENS)
+    merged = carryForwardIfMissing(prior, next, merged, HUB_OWNED_METADATA_FIELDS)
+    merged = preserveForkSummary(prior, next, merged)
+    merged = preserveCursorProtocolPair(prior, next, merged)
+    return merged ?? next
+}
+
+type DbSessionRow = {
+    content_revision: number
+    read_revision: number
+    read_state_version: number
+    manual_unread: number
+    id: string
+    tag: string | null
+    namespace: string
+    machine_id: string | null
+    created_at: number
+    updated_at: number
+    last_user_message_at: number | null
+    pinned: number
+    global_pinned: number
+    metadata: string | null
+    metadata_version: number
+    agent_state: string | null
+    agent_state_version: number
+    model: string | null
+    model_reasoning_effort: string | null
+    effort: string | null
+    service_tier: string | null
+    todos: string | null
+    todos_updated_at: number | null
+    team_state: string | null
+    team_state_updated_at: number | null
+    active: number
+    active_at: number | null
+    seq: number
+}
+
+function toStoredSession(row: DbSessionRow): StoredSession {
+    return {
+        id: row.id,
+        tag: row.tag,
+        namespace: row.namespace,
+        machineId: row.machine_id,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        lastUserMessageAt: row.last_user_message_at ?? undefined,
+        contentRevision: row.content_revision,
+        readState: { readRevision: row.read_revision, version: row.read_state_version, manualUnread: row.manual_unread === 1 },
+        pinned: row.pinned === 1,
+        globalPinned: row.global_pinned === 1,
+        metadata: safeJsonParse(row.metadata),
+        metadataVersion: row.metadata_version,
+        agentState: safeJsonParse(row.agent_state),
+        agentStateVersion: row.agent_state_version,
+        model: row.model,
+        modelReasoningEffort: row.model_reasoning_effort,
+        effort: row.effort,
+        serviceTier: row.service_tier,
+        todos: safeJsonParse(row.todos),
+        todosUpdatedAt: row.todos_updated_at,
+        teamState: safeJsonParse(row.team_state),
+        teamStateUpdatedAt: row.team_state_updated_at,
+        active: row.active === 1,
+        activeAt: row.active_at,
+        seq: row.seq
+    }
+}
+
+export function getOrCreateSession(
+    db: Database,
+    tag: string,
+    metadata: unknown,
+    agentState: unknown,
+    namespace: string,
+    model?: string,
+    effort?: string,
+    modelReasoningEffort?: string,
+    requestedId?: string
+): StoredSession {
+    const existing = prepareCached(db,
+        'SELECT * FROM sessions WHERE tag = ? AND namespace = ? ORDER BY created_at DESC LIMIT 1'
+    ).get(tag, namespace) as DbSessionRow | undefined
+
+    if (existing) {
+        if (requestedId && existing.id !== requestedId) {
+            throw new SessionIdentityConflictError('Session tag is already bound to a different id')
+        }
+        return toStoredSession(existing)
+    }
+
+    const now = Date.now()
+    const id = requestedId ?? randomUUID()
+
+    if (requestedId) {
+        const existingById = getSession(db, requestedId)
+        if (existingById) {
+            if (existingById.namespace === namespace && existingById.tag === tag) {
+                return existingById
+            }
+            throw new SessionIdentityConflictError('Session id is already bound to a different session')
+        }
+    }
+
+    const metadataJson = JSON.stringify(preserveSessionTitle(null, metadata))
+    const agentStateJson = agentState === null || agentState === undefined ? null : JSON.stringify(agentState)
+
+    prepareCached(db, `
+        INSERT INTO sessions (
+            id, tag, namespace, machine_id, created_at, updated_at,
+            metadata, metadata_version,
+            agent_state, agent_state_version,
+            model,
+            model_reasoning_effort,
+            effort,
+            todos, todos_updated_at,
+            active, active_at, seq
+        ) VALUES (
+            @id, @tag, @namespace, NULL, @created_at, @updated_at,
+            @metadata, 1,
+            @agent_state, 1,
+            @model,
+            @model_reasoning_effort,
+            @effort,
+            NULL, NULL,
+            0, @active_at, 0
+        )
+    `).run({
+        id,
+        tag,
+        namespace,
+        created_at: now,
+        updated_at: now,
+        // Never persist NULL — CLI SessionSchema requires numeric activeAt.
+        // Legacy rows may still be NULL; sessionCache coerces on read.
+        active_at: now,
+        metadata: metadataJson,
+        agent_state: agentStateJson,
+        model: model ?? null,
+        model_reasoning_effort: modelReasoningEffort ?? null,
+        effort: effort ?? null
+    })
+
+    const row = getSession(db, id)
+    if (!row) {
+        throw new Error('Failed to create session')
+    }
+    return row
+}
+
+export class SessionIdentityConflictError extends Error {
+    constructor(message: string) {
+        super(message)
+        this.name = 'SessionIdentityConflictError'
+    }
+}
+
+export class SessionNotAdoptableError extends Error {
+    constructor(message: string) {
+        super(message)
+        this.name = 'SessionNotAdoptableError'
+    }
+}
+
+/** Hub-internal stub tag for fresh machine spawn preallocation (#1911). */
+export function machineSpawnPreallocTag(sessionId: string): string {
+    return `machine-spawn:${sessionId}`
+}
+
+export function isMachineSpawnPreallocatedStub(session: Pick<StoredSession, 'id' | 'tag'>): boolean {
+    return session.tag === machineSpawnPreallocTag(session.id)
+}
+
+function isArchivedSessionMetadata(metadata: unknown): boolean {
+    if (!isPlainObject(metadata)) return false
+    return metadata.lifecycleState === 'archived'
+}
+
+/** Hub-authored archive only — CLI may archive itself on clean exit. */
+function isHubArchivedSessionMetadata(metadata: unknown): boolean {
+    if (!isPlainObject(metadata)) return false
+    return metadata.lifecycleState === 'archived' && metadata.archivedBy === 'hub'
+}
+
+/**
+ * When a CLI write would clear a hub archive, keep the forensic archive fields
+ * on the merged payload so the CAS ack returns success + still-archived
+ * (version-mismatch / error would spin forever in client backoff).
+ */
+function preserveHubArchiveOnMerged(prior: unknown, merged: unknown): unknown {
+    if (!isPlainObject(prior) || !isPlainObject(merged)) return prior
+    const next: Record<string, unknown> = { ...merged }
+    next.lifecycleState = prior.lifecycleState
+    next.archivedBy = prior.archivedBy
+    if (prior.archiveReason !== undefined) next.archiveReason = prior.archiveReason
+    else delete next.archiveReason
+    if (prior.lifecycleStateSince !== undefined) next.lifecycleStateSince = prior.lifecycleStateSince
+    return next
+}
+
+/**
+ * Bind a CLI create bootstrap to a hub-preallocated stub row.
+ * Overwrites tag + metadata (create-time fields) without minting a new id.
+ * Rejects rows that are not machine-spawn stubs — live sessions stay protected.
+ * Rejects archived stubs so adopt cannot resurrect and wipe archive metadata.
+ */
+export function adoptPreallocatedSession(
+    db: Database,
+    id: string,
+    tag: string,
+    metadata: unknown,
+    agentState: unknown,
+    namespace: string,
+    model?: string,
+    effort?: string,
+    modelReasoningEffort?: string
+): StoredSession {
+    return db.transaction(() => {
+        const existing = getSessionByNamespace(db, id, namespace)
+        if (!existing) {
+            throw new SessionNotAdoptableError('Session not found')
+        }
+
+        // Already adopted with this tag — idempotent reload (same as getOrCreate match).
+        if (existing.tag === tag) {
+            return existing
+        }
+
+        if (!isMachineSpawnPreallocatedStub(existing)) {
+            throw new SessionNotAdoptableError('Session is not a preallocated stub')
+        }
+
+        if (isArchivedSessionMetadata(existing.metadata)) {
+            throw new SessionNotAdoptableError('Session is archived')
+        }
+
+        // New tag must not already belong to another session in this namespace.
+        const tagOwner = prepareCached(db,
+            'SELECT id FROM sessions WHERE tag = ? AND namespace = ? LIMIT 1'
+        ).get(tag, namespace) as { id: string } | undefined
+        if (tagOwner && tagOwner.id !== id) {
+            throw new SessionIdentityConflictError('Session tag is already bound to a different id')
+        }
+
+        const now = Date.now()
+        const metadataJson = JSON.stringify(preserveSessionTitle(existing.metadata, mergeSessionMetadata(existing.metadata, metadata)))
+        const agentStateJson = agentState === null || agentState === undefined ? null : JSON.stringify(agentState)
+        const stubTag = machineSpawnPreallocTag(id)
+
+        // CAS on the stub tag — concurrent adopt / metadata release cannot win a race.
+        const changed = prepareCached(db, `
+            UPDATE sessions SET
+                tag = @tag,
+                metadata = @metadata,
+                metadata_version = metadata_version + 1,
+                agent_state = @agent_state,
+                agent_state_version = agent_state_version + 1,
+                model = @model,
+                model_reasoning_effort = @model_reasoning_effort,
+                effort = @effort,
+                updated_at = @updated_at,
+                seq = seq + 1
+            WHERE id = @id AND namespace = @namespace AND tag = @stub_tag
+        `).run({
+            id,
+            namespace,
+            tag,
+            stub_tag: stubTag,
+            metadata: metadataJson,
+            agent_state: agentStateJson,
+            model: model ?? null,
+            model_reasoning_effort: modelReasoningEffort ?? null,
+            effort: effort ?? null,
+            updated_at: now,
+        })
+
+        if (changed.changes !== 1) {
+            throw new SessionNotAdoptableError('Session is not a preallocated stub')
+        }
+
+        const updated = getSessionByNamespace(db, id, namespace)
+        if (!updated) {
+            throw new Error('Failed to adopt preallocated session')
+        }
+        return updated
+    })()
+}
+
+export function updateSessionMetadata(
+    db: Database,
+    id: string,
+    metadata: unknown,
+    expectedVersion: number,
+    namespace: string,
+    options?: { touchUpdatedAt?: boolean; allowUnarchive?: boolean; allowTitleUpdate?: boolean; titleLocked?: boolean; inheritTitleLockFrom?: string }
+): VersionedUpdateResult<unknown | null> {
+    const now = Date.now()
+    const touchUpdatedAt = options?.touchUpdatedAt !== false
+    const allowUnarchive = options?.allowUnarchive === true
+
+    try {
+        return db.transaction((): VersionedUpdateResult<unknown | null> => {
+            const existing = getSessionByNamespace(db, id, namespace)
+            if (!existing) {
+                return { result: 'error' }
+            }
+
+            const prior = existing.metadata
+            const sourceTitle = options?.inheritTitleLockFrom
+                ? getSessionByNamespace(db, options.inheritTitleLockFrom, namespace)?.metadata : null
+            const titleOwner = isPlainObject(prior) && prior.titleLocked === true ? prior
+                : isPlainObject(sourceTitle) && sourceTitle.titleLocked === true ? sourceTitle : prior
+            let merged = preserveSessionTitle(titleOwner, mergeSessionMetadata(prior, metadata), options)
+
+            // #1911 M1: unauthorized un-archive of hub-archived rows.
+            // Return success + merge-preserved archive fields — NOT version-mismatch
+            // or error (both spin forever in CLI updateMetadata backoff).
+            // Authorized revive uses allowUnarchive (clearSessionArchiveMetadata
+            // before spawn). Narrow to archivedBy=hub so CLI self-archive still
+            // transitions to running on clean reopen paths.
+            if (
+                isHubArchivedSessionMetadata(prior)
+                && !isArchivedSessionMetadata(merged)
+                && !allowUnarchive
+            ) {
+                merged = preserveHubArchiveOnMerged(prior, merged)
+            }
+
+            const result = updateVersionedField({
+                db,
+                table: 'sessions',
+                id,
+                namespace,
+                field: 'metadata',
+                versionField: 'metadata_version',
+                expectedVersion,
+                value: merged,
+                encode: (value) => {
+                    const json = JSON.stringify(value)
+                    return json === undefined ? null : json
+                },
+                decode: safeJsonParse,
+                setClauses: [
+                    'updated_at = CASE WHEN @touch_updated_at = 1 THEN @updated_at ELSE updated_at END',
+                    'seq = seq + 1'
+                ],
+                params: {
+                    updated_at: now,
+                    touch_updated_at: touchUpdatedAt ? 1 : 0
+                }
+            })
+
+            // Reopen flavors (--existing-session-id) never call adopt; they only
+            // updateMetadata. Release the machine-spawn stub tag here so live
+            // sessions are not permanently adoptable (#1911 Overseer Major).
+            // Skip when the write was a hub-archive preserve (still archived) —
+            // that is refuse-in-place, not live adopt (#1911 M1).
+            if (
+                result.result === 'success'
+                && !options?.allowTitleUpdate
+                && isMachineSpawnPreallocatedStub(existing)
+                && !isHubArchivedSessionMetadata(merged)
+            ) {
+                const liveTag = randomUUID()
+                prepareCached(db, `
+                    UPDATE sessions
+                    SET tag = @tag,
+                        updated_at = CASE WHEN @touch_updated_at = 1 THEN @updated_at ELSE updated_at END,
+                        seq = seq + 1
+                    WHERE id = @id
+                      AND namespace = @namespace
+                      AND tag = @stub_tag
+                `).run({
+                    id,
+                    namespace,
+                    tag: liveTag,
+                    stub_tag: existing.tag,
+                    updated_at: now,
+                    touch_updated_at: touchUpdatedAt ? 1 : 0,
+                })
+            }
+
+            return result
+        })()
+    } catch {
+        return { result: 'error' }
+    }
+}
+
+export function updateSessionAgentState(
+    db: Database,
+    id: string,
+    agentState: unknown,
+    expectedVersion: number,
+    namespace: string
+): VersionedUpdateResult<unknown | null> {
+    const now = Date.now()
+    const normalized = agentState ?? null
+    const prior = prepareCached(db, 'SELECT agent_state FROM sessions WHERE id = ? AND namespace = ?')
+        .get(id, namespace) as { agent_state: string | null } | undefined
+
+    return updateVersionedField({
+        db,
+        table: 'sessions',
+        id,
+        namespace,
+        field: 'agent_state',
+        versionField: 'agent_state_version',
+        expectedVersion,
+        value: normalized,
+        encode: (value) => (value === null ? null : JSON.stringify(value)),
+        decode: safeJsonParse,
+        setClauses: [
+            'updated_at = CASE WHEN @touch_updated_at = 1 THEN @updated_at ELSE updated_at END',
+            'seq = seq + 1'
+        ],
+        params: {
+            updated_at: now,
+            touch_updated_at: hasNewAgentStateRequest(safeJsonParse(prior?.agent_state ?? null), normalized) ? 1 : 0
+        }
+    })
+}
+
+// Routine agent-state snapshots (usage, controlledByUser, request
+// completion) are not session activity; only a new permission request is.
+function hasNewAgentStateRequest(prior: unknown, next: unknown): boolean {
+    const nextRequests = isPlainObject(next) ? next.requests : undefined
+    if (!isPlainObject(nextRequests)) {
+        return false
+    }
+    const priorRequests = isPlainObject(prior) && isPlainObject(prior.requests) ? prior.requests : {}
+    return Object.keys(nextRequests).some((requestId) => !Object.hasOwn(priorRequests, requestId))
+}
+
+export function setSessionTodos(
+    db: Database,
+    id: string,
+    todos: unknown,
+    todosUpdatedAt: number,
+    namespace: string
+): boolean {
+    try {
+        const json = todos === null || todos === undefined ? null : JSON.stringify(todos)
+        const result = prepareCached(db, `
+            UPDATE sessions
+            SET todos = @todos,
+                todos_updated_at = @todos_updated_at,
+                updated_at = CASE WHEN updated_at > @updated_at THEN updated_at ELSE @updated_at END,
+                seq = seq + 1
+            WHERE id = @id
+              AND namespace = @namespace
+              AND (todos_updated_at IS NULL OR todos_updated_at < @todos_updated_at)
+        `).run({
+            id,
+            todos: json,
+            todos_updated_at: todosUpdatedAt,
+            updated_at: todosUpdatedAt,
+            namespace
+        })
+
+        return result.changes === 1
+    } catch {
+        return false
+    }
+}
+
+/**
+ * Force-replace todos after rewind/fork (ignores the normal
+ * `todos_updated_at < candidate` guard so an older remaining TodoWrite can
+ * land). The watermark itself MUST still advance: SSE clients gate structured
+ * todos patches on `todosUpdatedAt`, and dual EventSources can deliver a
+ * buffered pre-rewind patch after the post-rewind Session. Writing the
+ * remaining message's older `createdAt` here would let that stale patch win
+ * and resurrect deleted todos (PR #897 HAPI Bot 2026-08-03 Major).
+ *
+ * Ratchet: `null → now`, else `previous + 1`. Always strictly greater than any
+ * prior write on this row, so lagged pre-rewind versions are rejected.
+ */
+export function replaceSessionTodos(
+    db: Database,
+    id: string,
+    todos: unknown,
+    namespace: string
+): boolean {
+    try {
+        const json = todos === null || todos === undefined ? null : JSON.stringify(todos)
+        const now = Date.now()
+        const result = prepareCached(db, `
+            UPDATE sessions
+            SET todos = @todos,
+                todos_updated_at = CASE
+                    WHEN todos_updated_at IS NULL THEN @now
+                    ELSE todos_updated_at + 1
+                END,
+                updated_at = CASE WHEN updated_at > @now THEN updated_at ELSE @now END,
+                seq = seq + 1
+            WHERE id = @id
+              AND namespace = @namespace
+        `).run({
+            id,
+            todos: json,
+            now,
+            namespace
+        })
+        return result.changes === 1
+    } catch {
+        return false
+    }
+}
+
+export function setSessionTeamState(
+    db: Database,
+    id: string,
+    teamState: unknown,
+    updatedAt: number,
+    namespace: string
+): boolean {
+    try {
+        const json = teamState === null || teamState === undefined ? null : JSON.stringify(teamState)
+        const result = prepareCached(db, `
+            UPDATE sessions
+            SET team_state = @team_state,
+                team_state_updated_at = @team_state_updated_at,
+                updated_at = CASE WHEN updated_at > @updated_at THEN updated_at ELSE @updated_at END,
+                seq = seq + 1
+            WHERE id = @id
+              AND namespace = @namespace
+              AND (team_state_updated_at IS NULL OR team_state_updated_at < @team_state_updated_at)
+        `).run({
+            id,
+            team_state: json,
+            team_state_updated_at: updatedAt,
+            updated_at: updatedAt,
+            namespace
+        })
+
+        return result.changes === 1
+    } catch {
+        return false
+    }
+}
+
+export function setSessionModel(
+    db: Database,
+    id: string,
+    model: string | null,
+    namespace: string,
+    options?: { touchUpdatedAt?: boolean }
+): boolean {
+    const now = Date.now()
+    const touchUpdatedAt = options?.touchUpdatedAt === true
+
+    try {
+        const result = prepareCached(db, `
+            UPDATE sessions
+            SET model = @model,
+                updated_at = CASE WHEN @touch_updated_at = 1 THEN @updated_at ELSE updated_at END,
+                seq = seq + 1
+            WHERE id = @id
+              AND namespace = @namespace
+              AND model IS NOT @model
+        `).run({
+            id,
+            namespace,
+            model,
+            updated_at: now,
+            touch_updated_at: touchUpdatedAt ? 1 : 0
+        })
+
+        return result.changes === 1
+    } catch {
+        return false
+    }
+}
+
+export function setSessionModelReasoningEffort(
+    db: Database,
+    id: string,
+    modelReasoningEffort: string | null,
+    namespace: string,
+    options?: { touchUpdatedAt?: boolean }
+): boolean {
+    const now = Date.now()
+    const touchUpdatedAt = options?.touchUpdatedAt === true
+
+    try {
+        const result = prepareCached(db, `
+            UPDATE sessions
+            SET model_reasoning_effort = @model_reasoning_effort,
+                updated_at = CASE WHEN @touch_updated_at = 1 THEN @updated_at ELSE updated_at END,
+                seq = seq + 1
+            WHERE id = @id
+              AND namespace = @namespace
+              AND model_reasoning_effort IS NOT @model_reasoning_effort
+        `).run({
+            id,
+            namespace,
+            model_reasoning_effort: modelReasoningEffort,
+            updated_at: now,
+            touch_updated_at: touchUpdatedAt ? 1 : 0
+        })
+
+        return result.changes === 1
+    } catch {
+        return false
+    }
+}
+
+export function setSessionServiceTier(
+    db: Database,
+    id: string,
+    serviceTier: string | null,
+    namespace: string,
+    options?: { touchUpdatedAt?: boolean }
+): boolean {
+    const now = Date.now()
+    const touchUpdatedAt = options?.touchUpdatedAt === true
+
+    try {
+        const result = prepareCached(db, `
+            UPDATE sessions
+            SET service_tier = @service_tier,
+                updated_at = CASE WHEN @touch_updated_at = 1 THEN @updated_at ELSE updated_at END,
+                seq = seq + 1
+            WHERE id = @id
+              AND namespace = @namespace
+              AND service_tier IS NOT @service_tier
+        `).run({
+            id,
+            namespace,
+            service_tier: serviceTier,
+            updated_at: now,
+            touch_updated_at: touchUpdatedAt ? 1 : 0
+        })
+
+        return result.changes === 1
+    } catch {
+        return false
+    }
+}
+
+export function setSessionEffort(
+    db: Database,
+    id: string,
+    effort: string | null,
+    namespace: string,
+    options?: { touchUpdatedAt?: boolean }
+): boolean {
+    const now = Date.now()
+    const touchUpdatedAt = options?.touchUpdatedAt === true
+
+    try {
+        const result = prepareCached(db, `
+            UPDATE sessions
+            SET effort = @effort,
+                updated_at = CASE WHEN @touch_updated_at = 1 THEN @updated_at ELSE updated_at END,
+                seq = seq + 1
+            WHERE id = @id
+              AND namespace = @namespace
+              AND effort IS NOT @effort
+        `).run({
+            id,
+            namespace,
+            effort,
+            updated_at: now,
+            touch_updated_at: touchUpdatedAt ? 1 : 0
+        })
+
+        return result.changes === 1
+    } catch {
+        return false
+    }
+}
+
+export function setSessionActive(
+    db: Database,
+    id: string,
+    active: boolean,
+    activeAt: number,
+    namespace: string
+): boolean {
+    try {
+        const result = prepareCached(db, `
+            UPDATE sessions
+            SET active = @active,
+                active_at = CASE
+                    WHEN active_at IS NULL OR active_at < @active_at THEN @active_at
+                    ELSE active_at
+                END,
+                seq = seq + 1
+            WHERE id = @id
+              AND namespace = @namespace
+              AND (active IS NOT @active OR active_at IS NULL OR active_at < @active_at)
+        `).run({
+            id,
+            namespace,
+            active: active ? 1 : 0,
+            active_at: activeAt
+        })
+
+        return result.changes === 1
+    } catch {
+        return false
+    }
+}
+
+export type SessionPinMode = 'none' | 'project' | 'global'
+
+export function setSessionPinMode(db: Database, id: string, mode: SessionPinMode, namespace: string): boolean {
+    const pinned = mode === 'project' ? 1 : 0
+    const globalPinned = mode === 'global' ? 1 : 0
+    const result = prepareCached(db, `
+        UPDATE sessions
+        SET pinned = @pinned,
+            global_pinned = @global_pinned
+        WHERE id = @id
+          AND namespace = @namespace
+          AND (pinned != @pinned OR global_pinned != @global_pinned)
+    `).run({ id, namespace, pinned, global_pinned: globalPinned })
+    return result.changes === 1
+}
+
+/** @deprecated Prefer setSessionPinMode — kept for project-pin merge helpers. */
+export function setSessionPinned(db: Database, id: string, pinned: boolean, namespace: string): boolean {
+    return setSessionPinMode(db, id, pinned ? 'project' : 'none', namespace)
+}
+
+export function touchSessionUpdatedAt(
+    db: Database,
+    id: string,
+    updatedAt: number,
+    namespace: string
+): boolean {
+    try {
+        const result = prepareCached(db, `
+            UPDATE sessions
+            SET updated_at = @updated_at,
+                seq = seq + 1
+            WHERE id = @id
+              AND namespace = @namespace
+              AND updated_at < @updated_at
+        `).run({
+            id,
+            namespace,
+            updated_at: updatedAt
+        })
+
+        return result.changes === 1
+    } catch {
+        return false
+    }
+}
+
+export function getSession(db: Database, id: string): StoredSession | null {
+    const row = prepareCached(db, 'SELECT * FROM sessions WHERE id = ?').get(id) as DbSessionRow | undefined
+    return row ? toStoredSession(row) : null
+}
+
+export function getSessionByNamespace(db: Database, id: string, namespace: string): StoredSession | null {
+    const row = prepareCached(db,
+        'SELECT * FROM sessions WHERE id = ? AND namespace = ?'
+    ).get(id, namespace) as DbSessionRow | undefined
+    return row ? toStoredSession(row) : null
+}
+
+export function getSessions(db: Database): StoredSession[] {
+    const rows = prepareCached(db, 'SELECT * FROM sessions ORDER BY updated_at DESC').all() as DbSessionRow[]
+    return rows.map(toStoredSession)
+}
+
+export function getSessionsByNamespace(db: Database, namespace: string): StoredSession[] {
+    const rows = prepareCached(db,
+        'SELECT * FROM sessions WHERE namespace = ? ORDER BY updated_at DESC'
+    ).all(namespace) as DbSessionRow[]
+    return rows.map(toStoredSession)
+}
+
+export function deleteSession(db: Database, id: string, namespace: string): boolean {
+    return runInTransaction(db, () => {
+        const existing = prepareCached(db,
+            'SELECT 1 FROM sessions WHERE id = ? AND namespace = ?'
+        ).get(id, namespace)
+        if (!existing) return false
+        removeMessageContentSearchForSession(db, id)
+        const result = prepareCached(db,
+            'DELETE FROM sessions WHERE id = ? AND namespace = ?'
+        ).run(id, namespace)
+        if (result.changes > 0) {
+            // Per-socket access memos stamp the epoch they were filled under;
+            // bumping makes their next event re-resolve instead of serving a
+            // grant for a row that no longer exists.
+            bumpSessionDeletionEpoch()
+        }
+        return result.changes > 0
+    })
+}

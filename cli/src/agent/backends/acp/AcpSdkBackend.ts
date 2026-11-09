@@ -1,0 +1,1915 @@
+import type { AgentFlavor } from '@hapi/protocol';
+import type { AgentBackend, AgentMessage, AgentSessionConfig, FormElicitationRequest, FormElicitationResponse, PermissionRequest, PermissionResponse, PromptContent } from '@/agent/types';
+import { asString, isObject } from '@hapi/protocol';
+import { AcpStdioTransport, type AcpStderrError } from './AcpStdioTransport';
+import { AcpMessageHandler, type AcpTextChunkMode } from './AcpMessageHandler';
+import { ACP_SESSION_UPDATE_TYPES, OPENCODE_CHILD_SESSION_UPDATES, OPENCODE_CHILD_UPDATE_METHOD } from './constants';
+import { thinkingHintFromSessionUpdate } from './shouldBumpThinkingFromSessionUpdate';
+import { logger } from '@/ui/logger';
+import { withRetry } from '@/utils/time';
+import packageJson from '../../../../package.json';
+
+type PendingPermission = {
+    resolve: (result: { outcome: { outcome: string; optionId?: string } }) => void;
+};
+
+type PendingElicitation = {
+    sessionId: string;
+    settle: (response: FormElicitationResponse) => void;
+};
+
+type AcpPromptUsage = {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens?: number;
+    thoughtTokens?: number;
+    cacheReadTokens?: number;
+    cacheCreationTokens?: number;
+};
+
+type AcpUsageUpdate = {
+    contextTokens: number | undefined;
+    contextWindow: number | undefined;
+};
+
+export type AcpModelDescriptor = {
+    modelId: string;
+    name?: string;
+    reasoningEfforts?: Array<{ value: string; name?: string; isDefault?: boolean }>;
+};
+
+export type AcpSessionModelsMetadata = {
+    availableModels: AcpModelDescriptor[];
+    currentModelId: string | null;
+};
+
+export type AcpSessionInfoUpdate = {
+    sessionId: string | null;
+    title: string | null;
+};
+
+export type AcpConfigOptionDescriptor = {
+    id: string;
+    category?: string;
+    currentValue?: string;
+    options: Array<{ value: string; name?: string }>;
+};
+
+/**
+ * Normalize ACP config-option choices to a flat `{ value, name }` list.
+ * Most agents send flat `options: [{ value, name }]`, but Zed-style grouped
+ * selects nest the leaves one level deeper:
+ * `options: [{ group, name, options: [{ value, name }] }]`
+ * (DeepSeek Harness 0.2.x uses this shape for its model picker — the leaf
+ * values are opaque strings, there just JSON-encoded provider+model tuples).
+ * Grouped entries carry no `value` of their own; their nested options are the
+ * real choices, so they are flattened recursively. Non-objects and empty
+ * values are dropped.
+ */
+export function flattenConfigOptionChoices(rawOptions: unknown[]): Array<{ value: string; name?: string }> {
+    const choices: Array<{ value: string; name?: string }> = [];
+    for (const entry of rawOptions) {
+        if (!isObject(entry)) continue;
+        const value = asString(entry.value);
+        if (value) {
+            choices.push({ value, name: asString(entry.name) ?? undefined });
+            continue;
+        }
+        const nested = Array.isArray(entry.options) ? entry.options : [];
+        if (nested.length > 0) {
+            choices.push(...flattenConfigOptionChoices(nested));
+        }
+    }
+    return choices;
+}
+
+type AcpInitializeResult = {
+    protocolVersion: number;
+    authMethods?: Array<{ id: string; name?: string }>;
+    agentCapabilities?: {
+        loadSession?: boolean;
+        promptCapabilities?: unknown;
+        sessionCapabilities?: Record<string, unknown>;
+    };
+};
+
+function userMessageChunkText(update: unknown): string | null {
+    if (!isObject(update) || update.sessionUpdate !== 'user_message_chunk') return null;
+    const content = update.content;
+    return isObject(content) && content.type === 'text' ? asString(content.text) : null;
+}
+
+export class AcpSdkBackend implements AgentBackend {
+    private transport: AcpStdioTransport | null = null;
+    private permissionHandler: ((request: PermissionRequest) => void) | null = null;
+    private stderrErrorHandler: ((error: AcpStderrError) => void) | null = null;
+    private readonly pendingPermissions = new Map<string, PendingPermission>();
+    private formElicitationHandler: ((request: FormElicitationRequest) => Promise<FormElicitationResponse>) | null = null;
+    private readonly pendingElicitations = new Set<PendingElicitation>();
+    private readonly sessionModelsMetadata = new Map<string, AcpSessionModelsMetadata>();
+    private readonly sessionConfigOptions = new Map<string, AcpConfigOptionDescriptor[]>();
+    private readonly sessionInfoRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    private readonly initialAvailableCommands = new Set<string>();
+    private readonly sessionAvailableCommands = new Map<string, Set<string>>();
+    private autoPermissionModeEnabled: boolean | null = null;
+    private messageHandler: AcpMessageHandler | null = null;
+    private activeSessionId: string | null = null;
+    private initializeResult: AcpInitializeResult | null = null;
+    private initializeInFlight: Promise<void> | null = null;
+    private setModeSupported: boolean | undefined = undefined;
+    private isProcessingMessage = false;
+    private promptRequestInFlight = false;
+    /** Concurrent session/prompt requests (main prompt + soft steers). */
+    private activePromptRequests = 0;
+    /** Foreground prompt only; soft steers are excluded after Abort. */
+    private foregroundPromptRequests = 0;
+    /** Bumped by abortSoftSteers; stale finishes from cancelled requests are dropped. */
+    private promptRequestEpoch = 0;
+    /** Incremented for each foreground prompt turn, including retry-wrapped turns. */
+    private promptGeneration = 0;
+    private responseCompleteResolvers: Array<() => void> = [];
+    private lastSessionUpdateAt = 0;
+    private latestUsageUpdate: AcpUsageUpdate | null = null;
+    private promptUsageCallback: ((msg: AgentMessage) => void) | null = null;
+    private usageUpdateListener: ((msg: AgentMessage) => void) | null = null;
+    private sessionInfoUpdateListener: ((update: AcpSessionInfoUpdate) => void) | null = null;
+    private userMessageChunkListener: ((text: string) => void) | null = null;
+    /** Fired on foreground ACP state / permission so launchers can bump hub thinking (#1470). */
+    private agentActivityListener: ((thinking: boolean) => void) | null = null;
+    /** Debounce timer for state_update running → thinking (#1502 chatter). */
+    private runningThinkingTimer: ReturnType<typeof setTimeout> | null = null;
+    private lastForwardedUsageUpdate: AcpUsageUpdate | null = null;
+    private sessionUpdateQueue: Promise<void> = Promise.resolve();
+    /**
+     * Most recent prompt()'s onUpdate. Child handlers emit through it, and
+     * keep using it after the prompt ends so background subagent output is
+     * not dropped between turns.
+     */
+    private childEmitSink: ((msg: AgentMessage) => void) | null = null;
+    /** Per-child message handlers, created on first update and kept across parent prompt changes. */
+    private readonly childHandlers = new Map<string, {
+        handler: AcpMessageHandler;
+        timer: ReturnType<typeof setTimeout> | null;
+    }>();
+
+    /** Retry configuration for ACP initialization */
+    private static readonly INIT_RETRY_OPTIONS = {
+        maxAttempts: 3,
+        minDelay: 1000,
+        maxDelay: 5000
+    };
+    private static readonly UPDATE_QUIET_PERIOD_MS = 120;
+    private static readonly UPDATE_DRAIN_TIMEOUT_MS = 2000;
+    private static readonly PRE_PROMPT_UPDATE_QUIET_PERIOD_MS = 200;
+    private static readonly PRE_PROMPT_UPDATE_DRAIN_TIMEOUT_MS = 1200;
+    private static readonly SESSION_TITLE_REFRESH_DELAYS_MS = [1000, 3000];
+    /** Cursor chatters running↔idle ~1–2s; require sustained running before bump. */
+    private static readonly RUNNING_THINKING_DEBOUNCE_MS = 750;
+    // After the initial post-prompt drain, slow-tailing models (DeepSeek,
+    // GPT-5.5, etc.) can keep sending agentMessageChunk notifications. We poll
+    // drainBuffers() on a short interval so the UI keeps streaming smoothly,
+    // and block prompt() from resolving until the model is truly quiet — that
+    // way turn_complete and the launcher's ready signal only fire after every
+    // straggler has been emitted to the current turn's onUpdate. Bounded by
+    // LATE_FLUSH_WINDOW_MS so a stuck stream never wedges the session.
+    //
+    // 6000ms covers tails up to ~5s observed against GPT-5.5 / DeepSeek V4 Pro
+    // with 1s headroom. 250ms quiet is anchored to drainLateBuffers entry
+    // time, so every turn pays at least one quiet period before resolving —
+    // that minimum is what catches stragglers arriving just after
+    // session/prompt resolves when the model paused mid-turn. 50ms polling
+    // keeps the UI responsive without measurable CPU cost (drainBuffers is a
+    // no-op on empty buffers). All three can be tightened once we have
+    // telemetry on real-world tail distributions.
+    private static readonly LATE_FLUSH_INTERVAL_MS = 50;
+    private static readonly LATE_FLUSH_QUIET_PERIOD_MS = 250;
+    private static readonly LATE_FLUSH_WINDOW_MS = 6000;
+
+    constructor(private readonly options: {
+        command: string;
+        args?: string[];
+        env?: Record<string, string>;
+        /** Working directory passed to the spawned process (v2 `opencode acp` ignores `--cwd`). */
+        spawnCwd?: string;
+        /** v2 model switching: use `session/set_config_option('model')` instead of `session/set_model` (removed in v2). */
+        acpModelSwitchViaConfigOption?: boolean;
+        /**
+         * OpenCode v2: opt in to `opencode/session/child_update`. Without it a
+         * background subagent's output is never sent once the parent turn has
+         * ended (OpenCode suppresses ordinary updates while it follows the
+         * child in the background).
+         */
+        childSessionUpdates?: boolean;
+        /**
+         * Advertise `elicitation.form` so the agent may ask the user structured
+         * questions through `elicitation/create`. Opt-in because the handler
+         * for that request is flavor specific; without a handler the agent
+         * would wait on a request nobody answers.
+         */
+        elicitationForm?: boolean;
+        textChunkMode?: AcpTextChunkMode;
+        flavor?: AgentFlavor;
+    }) {}
+
+    async initialize(): Promise<void> {
+        if (this.transport) return;
+        if (this.initializeInFlight) {
+            await this.initializeInFlight;
+            return;
+        }
+
+        this.initializeInFlight = this.bootstrapTransport();
+        try {
+            await this.initializeInFlight;
+        } finally {
+            this.initializeInFlight = null;
+        }
+    }
+
+    private async bootstrapTransport(): Promise<void> {
+        if (this.transport) return;
+
+        const transport = await AcpStdioTransport.create({
+            command: this.options.command,
+            args: this.options.args,
+            env: this.options.env,
+            cwd: this.options.spawnCwd
+        });
+
+        if (this.transport) {
+            await transport.close();
+            return;
+        }
+
+        this.transport = transport;
+
+        this.transport.onNotification((method, params) => {
+            this.handleNotification(method, params);
+        });
+
+        this.transport.onStderrError((error) => {
+            this.stderrErrorHandler?.(error);
+        });
+
+        this.transport.registerRequestHandler('session/request_permission', async (params, requestId) => {
+            return await this.handlePermissionRequest(params, requestId);
+        });
+
+        if (this.options.elicitationForm) {
+            this.transport.registerRequestHandler('elicitation/create', async (params) => {
+                return await this.handleElicitationRequest(params);
+            });
+        }
+
+        const response = await withRetry(
+            () => this.transport!.sendRequest('initialize', {
+                protocolVersion: 1,
+                clientCapabilities: {
+                    fs: { readTextFile: false, writeTextFile: false },
+                    terminal: false,
+                    ...(this.options.elicitationForm ? { elicitation: { form: {} } } : {}),
+                    _meta: {
+                        // Cursor ACP exposes Composer's non-fast/fast choice as separate
+                        // `model` + `fast` config options only when the client advertises
+                        // this capability. Agents that do not know this metadata ignore it.
+                        parameterizedModelPicker: true,
+                        ...(this.options.childSessionUpdates ? { [OPENCODE_CHILD_SESSION_UPDATES]: true } : {})
+                    }
+                },
+                clientInfo: {
+                    name: 'hapi',
+                    version: packageJson.version
+                }
+            }),
+            {
+                ...AcpSdkBackend.INIT_RETRY_OPTIONS,
+                onRetry: (error, attempt, nextDelayMs) => {
+                    logger.debug(`[ACP] Initialize attempt ${attempt} failed, retrying in ${nextDelayMs}ms`, error);
+                }
+            }
+        );
+
+        if (!isObject(response) || typeof response.protocolVersion !== 'number') {
+            throw new Error('Invalid initialize response from ACP agent');
+        }
+
+        this.captureAvailableCommands(null, response);
+
+        this.initializeResult = {
+            protocolVersion: response.protocolVersion,
+            authMethods: Array.isArray(response.authMethods)
+                ? response.authMethods
+                    .filter((entry): entry is Record<string, unknown> => isObject(entry))
+                    .map((entry) => ({
+                        id: asString(entry.id) ?? '',
+                        name: asString(entry.name) ?? undefined
+                    }))
+                    .filter((entry) => entry.id.length > 0)
+                : undefined,
+            agentCapabilities: isObject(response.agentCapabilities)
+                ? {
+                    loadSession: response.agentCapabilities.loadSession === true,
+                    promptCapabilities: response.agentCapabilities.promptCapabilities,
+                    sessionCapabilities: isObject(response.agentCapabilities.sessionCapabilities)
+                        ? response.agentCapabilities.sessionCapabilities
+                        : undefined
+                }
+                : undefined
+        };
+
+        logger.debug(`[ACP] Initialized with protocol version ${response.protocolVersion}`);
+    }
+
+    async authenticate(methodId: string): Promise<void> {
+        if (!this.transport) {
+            throw new Error('ACP transport not initialized');
+        }
+        await this.transport.sendRequest('_client/authenticate', { methodId });
+    }
+
+    async authenticateIfAvailable(methodId: string): Promise<void> {
+        const methods = this.initializeResult?.authMethods ?? [];
+        if (!methods.some((method) => method.id === methodId)) {
+            logger.debug(`[ACP] Auth method not advertised: ${methodId}`);
+            return;
+        }
+        try {
+            await this.authenticate(methodId);
+        } catch (error) {
+            // Cursor advertises cursor_login but may not implement _client/authenticate yet.
+            logger.debug(`[ACP] authenticate skipped (${methodId})`, error);
+        }
+    }
+
+    supportsLoadSession(): boolean {
+        return this.initializeResult?.agentCapabilities?.loadSession === true;
+    }
+
+    /** DSH's current ACP profile exposes `session/resume` under this capability. */
+    supportsSessionResume(): boolean {
+        const capabilities = this.initializeResult?.agentCapabilities?.sessionCapabilities;
+        return Boolean(capabilities && Object.prototype.hasOwnProperty.call(capabilities, 'resume'));
+    }
+
+    getSessionConfigOptions(sessionId: string): AcpConfigOptionDescriptor[] | undefined {
+        return this.sessionConfigOptions.get(sessionId);
+    }
+
+    getConfigOptionByCategory(sessionId: string, category: string): AcpConfigOptionDescriptor | undefined {
+        return this.sessionConfigOptions.get(sessionId)?.find((option) => option.category === category);
+    }
+
+    registerExtensionRequestHandler(
+        method: string,
+        handler: (params: unknown, requestId: string | number | null) => Promise<unknown>
+    ): void {
+        if (!this.transport) {
+            throw new Error('ACP transport not initialized');
+        }
+        this.transport.registerRequestHandler(method, handler);
+    }
+
+    async setMode(sessionId: string, modeId: string): Promise<void> {
+        if (!this.transport) {
+            throw new Error('ACP transport not initialized');
+        }
+
+        await this.waitForResponseComplete();
+
+        if (this.setModeSupported !== false) {
+            try {
+                await this.transport.sendRequest('session/set_mode', { sessionId, modeId });
+                this.setModeSupported = true;
+                this.updateThoughtLevelCurrentValue(sessionId, modeId);
+                return;
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                if (/method not found/i.test(message)) {
+                    this.setModeSupported = false;
+                } else {
+                    throw error;
+                }
+            }
+        }
+
+        const modeOption = this.getConfigOptionByCategory(sessionId, 'mode');
+        if (!modeOption) {
+            throw new Error('ACP agent does not support session/set_mode and no mode config option is available');
+        }
+
+        await this.setConfigOption(sessionId, modeOption.id, modeId);
+    }
+
+    async newSession(config: AgentSessionConfig): Promise<string> {
+        if (!this.transport) {
+            throw new Error('ACP transport not initialized');
+        }
+
+        const response = await withRetry(
+            () => this.transport!.sendRequest('session/new', {
+                cwd: config.cwd,
+                mcpServers: config.mcpServers
+            }),
+            {
+                ...AcpSdkBackend.INIT_RETRY_OPTIONS,
+                onRetry: (error, attempt, nextDelayMs) => {
+                    logger.debug(`[ACP] session/new attempt ${attempt} failed, retrying in ${nextDelayMs}ms`, error);
+                }
+            }
+        );
+
+        const sessionId = isObject(response) ? asString(response.sessionId) : null;
+        if (!sessionId) {
+            throw new Error('Invalid session/new response from ACP agent');
+        }
+
+        this.activeSessionId = sessionId;
+        this.captureSessionMetadata(sessionId, response);
+        return sessionId;
+    }
+
+    async loadSession(config: AgentSessionConfig & { sessionId: string }): Promise<string> {
+        if (!this.transport) {
+            throw new Error('ACP transport not initialized');
+        }
+
+        const response = await withRetry(
+            () => this.transport!.sendRequest('session/load', {
+                sessionId: config.sessionId,
+                cwd: config.cwd,
+                mcpServers: config.mcpServers
+            }),
+            {
+                ...AcpSdkBackend.INIT_RETRY_OPTIONS,
+                onRetry: (error, attempt, nextDelayMs) => {
+                    logger.debug(`[ACP] session/load attempt ${attempt} failed, retrying in ${nextDelayMs}ms`, error);
+                }
+            }
+        );
+
+        const loadedSessionId = isObject(response) ? asString(response.sessionId) : null;
+        const sessionId = loadedSessionId ?? config.sessionId;
+        this.activeSessionId = sessionId;
+        this.captureSessionMetadata(sessionId, response);
+        return sessionId;
+    }
+
+    /**
+     * Resume a persisted session through DSH's ACP extension. Unlike
+     * `session/load`, DSH returns config options without replaying history;
+     * HAPI's Hub remains the transcript source for the chat UI.
+     */
+    async resumeSession(config: AgentSessionConfig & { sessionId: string }): Promise<string> {
+        if (!this.transport) {
+            throw new Error('ACP transport not initialized');
+        }
+
+        const response = await withRetry(
+            () => this.transport!.sendRequest('session/resume', {
+                sessionId: config.sessionId,
+                cwd: config.cwd,
+                mcpServers: config.mcpServers
+            }),
+            {
+                ...AcpSdkBackend.INIT_RETRY_OPTIONS,
+                onRetry: (error, attempt, nextDelayMs) => {
+                    logger.debug(`[ACP] session/resume attempt ${attempt} failed, retrying in ${nextDelayMs}ms`, error);
+                }
+            }
+        );
+
+        const resumedSessionId = isObject(response) ? asString(response.sessionId) : null;
+        const sessionId = resumedSessionId ?? config.sessionId;
+        this.activeSessionId = sessionId;
+        this.captureSessionMetadata(sessionId, response);
+        return sessionId;
+    }
+
+    async setModel(
+        sessionId: string,
+        modelId: string,
+        opts?: { flavor?: AgentFlavor }
+    ): Promise<void> {
+        if (!this.transport) {
+            throw new Error('ACP transport not initialized');
+        }
+
+        // The launcher serializes setModel between turns, but defensively wait for any
+        // in-flight prompt to drain so we never interleave a switch with a session/prompt.
+        await this.waitForResponseComplete();
+
+        // opencode v2 removed `session/set_model` from the wire (verified
+        // 2026-10-15: "Method not found"); the replacement is
+        // `session/set_config_option` with the fixed configId "model". Only
+        // taken when the launcher opted in via `acpModelSwitchViaConfigOption`
+        // AND the session actually advertises a model config option —
+        // otherwise fall through to the legacy path below unchanged.
+        if (this.options.acpModelSwitchViaConfigOption === true) {
+            const modelOption = this.sessionConfigOptions.get(sessionId)?.find((option) => option.id === 'model');
+            if (modelOption) {
+                await this.setConfigOption(sessionId, 'model', modelId);
+                if (opts?.flavor === 'opencode' || opts?.flavor === 'grok') {
+                    this.updateCurrentModelOptimistic(sessionId, modelId);
+                }
+                return;
+            }
+        }
+
+        // ACP defines `session/set_model` ({ sessionId, modelId }) for inline model
+        // switching — see ACP SDK schema `x-method: session/set_model`. OpenCode
+        // 1.14.30 implements this exact wire name (the SDK's TypeScript helper is
+        // exposed as `unstable_setSessionModel` but the JSON-RPC method on the wire
+        // is unprefixed). Errors (including JSON-RPC 'method not found') propagate
+        // as rejections from the transport; the launcher's catch block handles them.
+        let configOptionResponse: unknown;
+        let usedConfigOption = false;
+        if (opts?.flavor === 'opencode') {
+            // OpenCode's `session/set_model` response only carries an opaque
+            // `_meta` block with no `configOptions`, so the per-session
+            // thought_level options captured at session/new go stale after an
+            // inline switch. `session/set_config_option` with configId "model"
+            // (OpenCode's fixed id for the model picker) echoes fresh
+            // `configOptions` including thought_level for the new model.
+            try {
+                configOptionResponse = await this.transport.sendRequest('session/set_config_option', {
+                    sessionId,
+                    configId: 'model',
+                    value: modelId
+                });
+                usedConfigOption = true;
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                // Older OpenCode builds predate set_config_option — fall back to
+                // the legacy set_model path below. Any other error propagates to
+                // the launcher's existing catch handling.
+                if (!/method not found/i.test(message)) {
+                    throw error;
+                }
+            }
+        }
+
+        const response = usedConfigOption
+            ? configOptionResponse
+            : await this.transport.sendRequest('session/set_model', {
+                sessionId,
+                modelId
+            });
+
+        if (usedConfigOption) {
+            this.captureSessionMetadata(sessionId, response);
+        } else if (opts?.flavor === 'opencode' || opts?.flavor === 'grok') {
+            // OpenCode's set_model response only carries an opaque `_meta` block,
+            // not `availableModels`/`currentModelId`. Optimistically update the
+            // cached currentModelId (the call succeeded, so the agent has switched)
+            // while preserving the availableModels list captured from session/new.
+            this.updateCurrentModelOptimistic(sessionId, modelId);
+            if (opts.flavor === 'opencode') {
+                const options = this.sessionConfigOptions.get(sessionId);
+                if (options) {
+                    this.sessionConfigOptions.set(
+                        sessionId,
+                        options.filter((option) => option.category !== 'thought_level')
+                    );
+                }
+            }
+        } else {
+            // For other flavors (e.g. Gemini), if the response carries metadata,
+            // capture it. Missing fields are silently ignored.
+            this.captureSessionMetadata(sessionId, response);
+        }
+    }
+
+    async setConfigOption(
+        sessionId: string,
+        configId: string,
+        value: string
+    ): Promise<void> {
+        if (!this.transport) {
+            throw new Error('ACP transport not initialized');
+        }
+
+        await this.waitForResponseComplete();
+
+        const response = await this.transport.sendRequest('session/set_config_option', {
+            sessionId,
+            configId,
+            value
+        });
+        this.captureSessionMetadata(sessionId, response);
+    }
+
+    /**
+     * Low-level extension RPC for agent-specific methods (e.g. Grok `_x.ai/*`).
+     * Keep method names and schemas in the agent adapter — not here.
+     */
+    async sendExtensionRequest<T = unknown>(
+        method: string,
+        params: Record<string, unknown>,
+        options?: { timeoutMs?: number }
+    ): Promise<T> {
+        if (!this.transport) {
+            throw new Error('ACP transport not initialized');
+        }
+        return await this.transport.sendRequest(method, params, {
+            timeoutMs: options?.timeoutMs
+        }) as T;
+    }
+
+    /**
+     * Returns the per-session models metadata captured from session/new (or
+     * session/load, or session/set_model). Returns undefined if the agent did
+     * not include the optional `models` block in its response.
+     */
+    getSessionModelsMetadata(sessionId: string): AcpSessionModelsMetadata | undefined {
+        return this.sessionModelsMetadata.get(sessionId);
+    }
+
+    getThoughtLevelConfigOption(sessionId: string): AcpConfigOptionDescriptor | undefined {
+        return this.sessionConfigOptions.get(sessionId)?.find((option) => option.category === 'thought_level');
+    }
+
+    hasAvailableCommand(sessionId: string, command: string): boolean {
+        if (command === 'auto' && this.autoPermissionModeEnabled === true) {
+            return true;
+        }
+        return this.sessionAvailableCommands.get(sessionId)?.has(command)
+            ?? this.initialAvailableCommands.has(command);
+    }
+
+    /** Forwards ACP `usage_update` to the web status bar when no prompt is active (e.g. session resume). */
+    setUsageUpdateListener(listener: ((msg: AgentMessage) => void) | null): void {
+        this.usageUpdateListener = listener;
+    }
+
+    /** Forwards stable ACP session metadata updates independently of prompt streaming. */
+    setSessionInfoUpdateListener(listener: ((update: AcpSessionInfoUpdate) => void) | null): void {
+        this.sessionInfoUpdateListener = listener;
+    }
+
+    /** Called in order with agent output: text buffered before an echo is flushed first. */
+    setUserMessageChunkListener(listener: ((text: string) => void) | null): void {
+        this.userMessageChunkListener = listener;
+    }
+
+    /**
+     * Called when ACP reports foreground state / permission for harness wake (#1470 / #1502).
+     * `true` = sustained `running` (debounced), `requires_action`, or permission.
+     * `false` = `state_update` idle (skipped while a HAPI prompt turn is still draining).
+     * Launchers should ignore no-ops when session.thinking already matches.
+     */
+    setAgentActivityListener(listener: ((thinking: boolean) => void) | null): void {
+        this.agentActivityListener = listener;
+    }
+
+    /** Reads the agent's persisted native title through stable ACP session/list. */
+    async refreshSessionInfo(sessionId: string, cwd: string): Promise<void> {
+        const existingTimer = this.sessionInfoRefreshTimers.get(sessionId);
+        if (existingTimer) {
+            clearTimeout(existingTimer);
+            this.sessionInfoRefreshTimers.delete(sessionId);
+        }
+        await this.refreshSessionInfoAttempt(sessionId, cwd, 0);
+    }
+
+    private async refreshSessionInfoAttempt(sessionId: string, cwd: string, retryIndex: number): Promise<void> {
+        if (!this.transport) {
+            return;
+        }
+        try {
+            const response = await this.transport.sendRequest('session/list', { cwd }, { timeoutMs: 5000 });
+            if (!isObject(response) || !Array.isArray(response.sessions)) {
+                return;
+            }
+            const match = response.sessions.find((entry) =>
+                isObject(entry) && asString(entry.sessionId) === sessionId
+            );
+            if (!isObject(match) || (typeof match.title !== 'string' && match.title !== null)) {
+                return;
+            }
+            this.sessionInfoUpdateListener?.({ sessionId, title: match.title });
+            if (match.title === null || !this.isPlaceholderSessionTitle(match.title)) {
+                return;
+            }
+            const delayMs = AcpSdkBackend.SESSION_TITLE_REFRESH_DELAYS_MS[retryIndex];
+            if (delayMs === undefined) {
+                return;
+            }
+            const timer = setTimeout(() => {
+                this.sessionInfoRefreshTimers.delete(sessionId);
+                void this.refreshSessionInfoAttempt(sessionId, cwd, retryIndex + 1);
+            }, delayMs);
+            timer.unref();
+            this.sessionInfoRefreshTimers.set(sessionId, timer);
+        } catch (error) {
+            logger.debug('[ACP] session/list title refresh unavailable', error);
+        }
+    }
+
+    private isPlaceholderSessionTitle(title: string): boolean {
+        const normalizedTitle = title.trim();
+        return normalizedTitle.length === 0
+            || normalizedTitle === 'Untitled'
+            || /^(?:New|Child) session - \d{4}-\d{2}-\d{2}T/.test(normalizedTitle);
+    }
+
+    async prompt(
+        sessionId: string,
+        content: PromptContent[],
+        onUpdate: (msg: AgentMessage) => void,
+        // prompt() waits for earlier output before it sends and for late output
+        // after the answer; callers timing the agent itself need both moments.
+        timing?: { onSent?: () => void; onAnswered?: () => void }
+    ): Promise<void> {
+        if (!this.transport) {
+            throw new Error('ACP transport not initialized');
+        }
+
+        this.activeSessionId = sessionId;
+        // Single-phase handler swap: drain any chunks still buffered in the
+        // previous turn's handler so they emit via that turn's onUpdate, then
+        // immediately install the new handler. The post-prompt drainLateBuffers
+        // means by this point the previous turn should already be quiet; this
+        // wait is a cheap safety net for the rare case where a chunk arrived
+        // between prompt() resolving and the next turn starting.
+        await this.waitForSessionUpdateQuiet(
+            AcpSdkBackend.PRE_PROMPT_UPDATE_QUIET_PERIOD_MS,
+            AcpSdkBackend.PRE_PROMPT_UPDATE_DRAIN_TIMEOUT_MS
+        );
+        await this.sessionUpdateQueue;
+        this.messageHandler?.drainBuffers();
+        this.messageHandler = new AcpMessageHandler(onUpdate, {
+            textChunkMode: this.options.textChunkMode,
+            flavor: this.options.flavor,
+        });
+        this.promptGeneration++;
+        this.foregroundPromptRequests++;
+        const promptRequestEpoch = this.beginPromptRequest();
+        this.lastSessionUpdateAt = Date.now();
+        this.latestUsageUpdate = null;
+        this.lastForwardedUsageUpdate = null;
+        this.promptUsageCallback = onUpdate;
+        this.childEmitSink = onUpdate;
+        let stopReason: string | null = null;
+        let promptUsage: AcpPromptUsage | null = null;
+
+        try {
+            // No timeout for prompt requests - they can run for extended periods
+            // during complex tasks, tool-heavy operations, or slow model responses
+            this.promptRequestInFlight = true;
+            let response: unknown;
+            try {
+                const request = this.transport.sendRequest('session/prompt', {
+                    sessionId,
+                    prompt: content
+                }, { timeoutMs: Infinity });
+                timing?.onSent?.();
+                response = await request;
+            } finally {
+                this.promptRequestInFlight = false;
+                timing?.onAnswered?.();
+            }
+
+            stopReason = isObject(response) ? asString(response.stopReason) : null;
+            promptUsage = this.extractPromptUsage(response);
+        } finally {
+            // Cursor (#2267/#2268): drain any session updates already queued with
+            // the native response, then seal a done footer before the quiet
+            // window so finished-shell harness text cannot bury it in one flush.
+            await this.sessionUpdateQueue;
+            if (this.options.flavor === 'cursor') {
+                this.messageHandler?.sealDoneNotifySummaryIfPresent();
+            }
+            await this.waitForSessionUpdateQuiet(
+                AcpSdkBackend.UPDATE_QUIET_PERIOD_MS,
+                AcpSdkBackend.UPDATE_DRAIN_TIMEOUT_MS
+            );
+            await this.sessionUpdateQueue;
+            this.messageHandler?.drainBuffers();
+            // Block here until the model truly stops streaming straggler
+            // chunks (or LATE_FLUSH_WINDOW_MS elapses), so turn_complete and
+            // the launcher's ready signal only fire once every chunk has been
+            // emitted to this turn's onUpdate.
+            await this.drainLateBuffers();
+            // Late window can enqueue async image registration; drain again
+            // before turn_complete so generated_image precedes turn boundary.
+            await this.sessionUpdateQueue;
+            this.messageHandler?.drainBuffers();
+            try {
+                const latestUsageUpdate = this.readLatestUsageUpdate();
+                if (promptUsage) {
+                    onUpdate({
+                        type: 'usage',
+                        inputTokens: promptUsage.inputTokens,
+                        outputTokens: promptUsage.outputTokens,
+                        totalTokens: promptUsage.totalTokens,
+                        thoughtTokens: promptUsage.thoughtTokens,
+                        cacheReadTokens: promptUsage.cacheReadTokens,
+                        ...(promptUsage.cacheCreationTokens !== undefined
+                            ? { cacheCreationTokens: promptUsage.cacheCreationTokens }
+                            : {}),
+                        contextTokens: latestUsageUpdate ? latestUsageUpdate.contextTokens : undefined,
+                        contextWindow: latestUsageUpdate ? latestUsageUpdate.contextWindow : undefined
+                    });
+                } else if (
+                    latestUsageUpdate
+                    && (latestUsageUpdate.contextTokens !== undefined || latestUsageUpdate.contextWindow !== undefined)
+                    && !this.hasForwardedUsage(latestUsageUpdate)
+                ) {
+                    // Agent did not return prompt usage (slash-handled turns,
+                    // errored turns), but we did see ACP usage updates during
+                    // the turn. Emit a context-only usage so the status bar
+                    // reflects the current context size.
+                    onUpdate({
+                        type: 'usage',
+                        inputTokens: 0,
+                        outputTokens: 0,
+                        contextTokens: latestUsageUpdate.contextTokens,
+                        contextWindow: latestUsageUpdate.contextWindow
+                    });
+                }
+                if (stopReason) {
+                    onUpdate({ type: 'turn_complete', stopReason });
+                }
+            } finally {
+                this.promptUsageCallback = null;
+                this.foregroundPromptRequests = Math.max(0, this.foregroundPromptRequests - 1);
+                if (promptRequestEpoch !== this.promptRequestEpoch) {
+                    this.activePromptRequests = Math.max(0, this.activePromptRequests - 1);
+                    this.isProcessingMessage = this.activePromptRequests > 0;
+                    if (!this.isProcessingMessage) this.notifyResponseComplete();
+                } else {
+                    this.finishPromptRequest(promptRequestEpoch);
+                }
+            }
+        }
+    }
+
+    async cancelPrompt(sessionId: string): Promise<void> {
+        if (!this.transport) {
+            return;
+        }
+
+        this.transport.sendNotification('session/cancel', { sessionId });
+        // The agent keeps waiting on an unanswered form until its request is
+        // answered, so cancelling the prompt must settle the form too.
+        this.settlePendingElicitations(sessionId);
+    }
+
+    /**
+     * Soft-inject a follow-up `session/prompt` while another prompt is in flight.
+     *
+     * Used for Cursor mid-turn steer (GUI "Send" / next-opportune soft send).
+     * Does **not** cancel the active prompt and does **not** swap message handlers —
+     * `session/update` notifications keep flowing to the in-flight turn's handler.
+     *
+     * Awaits the full concurrent `session/prompt` JSON-RPC response (turn completion
+     * for that inject). Do **not** call this from the hub `SteerQueuedMessage` handler —
+     * that RPC uses a 30s Socket.IO timeout. Use {@link beginSoftSteerPrompt} there.
+     */
+    async softSteerPrompt(sessionId: string, content: PromptContent[]): Promise<void> {
+        if (!this.transport) {
+            throw new Error('ACP transport not initialized');
+        }
+        if (!this.isProcessingMessage) {
+            throw new Error('No active ACP prompt to soft-steer into');
+        }
+
+        const promptRequestEpoch = this.beginPromptRequest();
+        try {
+            await this.transport.sendRequest('session/prompt', {
+                sessionId,
+                prompt: content
+            }, { timeoutMs: Infinity });
+        } finally {
+            this.finishPromptRequest(promptRequestEpoch);
+        }
+    }
+
+    /**
+     * Kick off a soft steer without blocking the hub RPC on turn completion.
+     * Separates transport dispatch from prompt completion so callers can commit
+     * queue state only after stdin accepted the request without waiting for the turn.
+     */
+    beginSoftSteerPrompt(sessionId: string, content: PromptContent[], options?: {
+        // Agents that answer each request with its own share (Antigravity)
+        // need every response's usage to total the turn.
+        onUsage?: (usage: Extract<AgentMessage, { type: 'usage' }>) => void;
+    }): {
+        dispatched: Promise<void>;
+        /** Settles when the agent answers, before late output is drained. */
+        answered: Promise<void>;
+        /** Resolves with the ACP stopReason (`cancelled` after session/cancel). */
+        completed: Promise<string | null>;
+    } {
+        if (!this.transport) {
+            throw new Error('ACP transport not initialized');
+        }
+        if (!this.isProcessingMessage) {
+            throw new Error('No active ACP prompt to soft-steer into');
+        }
+
+        const transport = this.transport;
+        const promptRequestEpoch = this.beginPromptRequest();
+        const request = transport.sendRequestWithDispatch('session/prompt', {
+            sessionId,
+            prompt: content
+        }, { timeoutMs: Infinity, dispatchTimeoutMs: 20_000 });
+        const completed = (async () => {
+            try {
+                const response = await request.completed;
+                const usage = options?.onUsage ? this.extractPromptUsage(response) : null;
+                if (usage) {
+                    const context = this.readLatestUsageUpdate();
+                    options?.onUsage?.({
+                        type: 'usage',
+                        ...usage,
+                        contextTokens: context?.contextTokens,
+                        contextWindow: context?.contextWindow
+                    });
+                }
+                return isObject(response) ? asString(response.stopReason) : null;
+            } finally {
+                try {
+                    await this.waitForSessionUpdateQuiet(
+                        AcpSdkBackend.UPDATE_QUIET_PERIOD_MS,
+                        AcpSdkBackend.UPDATE_DRAIN_TIMEOUT_MS
+                    );
+                    this.messageHandler?.drainBuffers();
+                    await this.drainLateBuffers();
+                    this.messageHandler?.drainBuffers();
+                } finally {
+                    this.finishPromptRequest(promptRequestEpoch);
+                }
+            }
+        })();
+
+        void completed.catch((error) => {
+            // An Error logs as `{}`.
+            logger.warn('[ACP] soft-steer session/prompt failed', {
+                message: error instanceof Error ? error.message : String(error),
+                code: (error as { code?: unknown } | null)?.code
+            });
+        });
+
+        const answered = request.completed.then(() => {}, () => {});
+        return { dispatched: request.dispatched, answered, completed };
+    }
+
+    async respondToPermission(
+        _sessionId: string,
+        request: PermissionRequest,
+        response: PermissionResponse
+    ): Promise<void> {
+        const pending = this.pendingPermissions.get(request.id);
+        if (!pending) {
+            logger.debug('[ACP] No pending permission request for id', request.id);
+            return;
+        }
+
+        this.pendingPermissions.delete(request.id);
+
+        if (response.outcome === 'cancelled') {
+            pending.resolve({ outcome: { outcome: 'cancelled' } });
+            return;
+        }
+
+        pending.resolve({
+            outcome: {
+                outcome: 'selected',
+                optionId: response.optionId
+            }
+        });
+    }
+
+    onPermissionRequest(handler: (request: PermissionRequest) => void): void {
+        this.permissionHandler = handler;
+    }
+
+    onFormElicitation(handler: (request: FormElicitationRequest) => Promise<FormElicitationResponse>): void {
+        this.formElicitationHandler = handler;
+    }
+
+    private settlePendingElicitations(sessionId?: string): void {
+        for (const pending of Array.from(this.pendingElicitations)) {
+            if (sessionId === undefined || pending.sessionId === sessionId) {
+                pending.settle({ action: 'cancel' });
+            }
+        }
+    }
+
+    private async handleElicitationRequest(params: unknown): Promise<FormElicitationResponse> {
+        const cancel: FormElicitationResponse = { action: 'cancel' };
+        if (!isObject(params) || params.mode !== 'form' || !this.formElicitationHandler) {
+            return cancel;
+        }
+        const sessionId = asString(params.sessionId);
+        if (!sessionId || !isObject(params.requestedSchema)) {
+            return cancel;
+        }
+
+        const request: FormElicitationRequest = {
+            sessionId,
+            ...(asString(params.toolCallId) ? { toolCallId: asString(params.toolCallId) as string } : {}),
+            message: asString(params.message) ?? '',
+            requestedSchema: params.requestedSchema
+        };
+
+        return await new Promise<FormElicitationResponse>((resolve) => {
+            const pending: PendingElicitation = {
+                sessionId,
+                settle: (response) => {
+                    this.pendingElicitations.delete(pending);
+                    resolve(response);
+                }
+            };
+            this.pendingElicitations.add(pending);
+            this.agentActivityListener?.(true);
+            this.formElicitationHandler!(request).then(
+                (response) => pending.settle(response),
+                (error) => {
+                    logger.warn('[ACP] form elicitation handler failed; cancelling', error);
+                    pending.settle(cancel);
+                }
+            );
+        });
+    }
+
+    onStderrError(handler: (error: AcpStderrError) => void): void {
+        this.stderrErrorHandler = handler;
+    }
+
+    /**
+     * Runs `fn` with `session/update` notifications temporarily prevented
+     * from reaching whatever `messageHandler` is currently installed (i.e.
+     * the last prompt() turn's handler), restoring it once `fn` settles.
+     *
+     * Needed for out-of-band calls that don't go through `prompt()` at all —
+     * e.g. OpenCode's /compact bridge, which triggers native compaction via
+     * a raw HTTP request to the agent subprocess instead of `session/prompt`.
+     * The agent keeps streaming `session/update` notifications (thought
+     * chunks etc.) over the same ACP transport while that HTTP call runs,
+     * and `handleSessionUpdate` forwards them unconditionally — with no
+     * prompt() turn in flight to own them, they'd otherwise land on the
+     * previous turn's now-stale `messageHandler` and render as a duplicate
+     * assistant message alongside whatever the caller explicitly displays
+     * from the HTTP response.
+     *
+     * `captureAvailableCommands` / `forwardSessionInfoUpdate` /
+     * `captureUsageUpdate` in `handleSessionUpdate` are untouched by this —
+     * only the `messageHandler.handleUpdate` forwarding is suppressed.
+     *
+     * Session-agnostic: this is a pure prompt()-adjacent utility with no
+     * Gemini/OpenCode-specific behavior, so it's safe on the shared
+     * AcpSdkBackend class — nothing calls it unless a caller opts in.
+     *
+     * The `this.messageHandler === null` guard on restore is defense in
+     * depth: normal serialization (compact and prompts run through the same
+     * single dequeue loop — see opencodeRemoteLauncher.ts) means `fn` should
+     * never overlap with a real prompt() turn, but if `disconnect()` or a
+     * new `prompt()` did run concurrently and changed `messageHandler`
+     * during `fn`, this avoids clobbering whatever it set.
+     *
+     * Restoring the handler waits for the same quiet-drain `prompt()` already
+     * uses before installing a *new* handler for the next turn (see its
+     * `PRE_PROMPT_UPDATE_QUIET_PERIOD_MS`/`_DRAIN_TIMEOUT_MS` call) — the
+     * same class of race, just on the way back in instead of the way out.
+     * Aborting `fn()` client-side (e.g. OpenCode's compact bridge aborting
+     * its HTTP call) does not necessarily stop the agent from continuing the
+     * operation server-side: `session/update` is a separate notification
+     * channel from that HTTP request's lifecycle (confirmed while building
+     * the /compact bridge — see runCompactOperation's doc comment). Without
+     * this wait, late notifications from a still-running server-side
+     * operation would immediately leak into whichever handler gets restored
+     * (or into a brand new one prompt() installs right after) the instant
+     * `fn()` returns. `messageHandler` stays null (suppression still in
+     * effect) for the whole drain, so nothing leaks during it either.
+     */
+    async suppressUpdatesDuring<T>(fn: () => Promise<T>): Promise<T> {
+        const previousHandler = this.messageHandler;
+        this.messageHandler = null;
+        try {
+            return await fn();
+        } finally {
+            await this.waitForSessionUpdateQuiet(
+                AcpSdkBackend.PRE_PROMPT_UPDATE_QUIET_PERIOD_MS,
+                AcpSdkBackend.PRE_PROMPT_UPDATE_DRAIN_TIMEOUT_MS
+            );
+            if (this.messageHandler === null) {
+                this.messageHandler = previousHandler;
+            }
+        }
+    }
+
+    /**
+     * Returns true if currently processing a message (prompt in progress).
+     * Useful for checking if it's safe to perform session operations.
+     */
+    get processingMessage(): boolean {
+        return this.activePromptRequests > 0;
+    }
+
+    isPromptRequestInFlight(): boolean {
+        return this.promptRequestInFlight;
+    }
+
+    getPromptGeneration(): number {
+        return this.promptGeneration;
+    }
+
+    isTransportAlive(): boolean {
+        return this.transport?.isAlive() ?? false;
+    }
+
+    /** PID of the spawned ACP agent process, when known (used by the opencode v2 REST discovery). */
+    getProcessPid(): number | null {
+        return this.transport ? this.transport.getProcessPid() : null;
+    }
+
+    getLastSessionUpdateAt(): number {
+        return this.lastSessionUpdateAt;
+    }
+
+    /**
+     * Drop buffered speech on the current message handler without emitting.
+     * Cursor post-done silence (#2267): call while the silence gate still
+     * applies, before opening the next HAPI prompt, so prompt()'s pre-swap
+     * drain cannot resurrect a suppressed harness-resume live snapshot.
+     */
+    async discardPendingMessageBuffers(): Promise<void> {
+        await this.sessionUpdateQueue;
+        this.messageHandler?.discardBuffers();
+    }
+
+    /**
+     * Wait for any in-progress response to complete.
+     * Resolves immediately if no response is being processed.
+     * Use this before performing operations that require the response to be complete,
+     * like session swap or sending task_complete.
+     */
+    async waitForResponseComplete(): Promise<void> {
+        if (this.activePromptRequests === 0) {
+            return;
+        }
+        return new Promise<void>((resolve) => {
+            this.responseCompleteResolvers.push(resolve);
+        });
+    }
+
+    async disconnect(): Promise<void> {
+        if (!this.transport) return;
+        for (const timer of this.sessionInfoRefreshTimers.values()) {
+            clearTimeout(timer);
+        }
+        this.sessionInfoRefreshTimers.clear();
+        this.clearRunningThinkingTimer();
+        await this.sessionUpdateQueue;
+        for (const entry of this.childHandlers.values()) {
+            this.clearChildQuietTimer(entry);
+            entry.handler.drainBuffers();
+        }
+        this.childHandlers.clear();
+        this.childEmitSink = null;
+        this.messageHandler?.drainBuffers();
+        this.messageHandler = null;
+        this.activeSessionId = null;
+        this.activePromptRequests = 0;
+        this.foregroundPromptRequests = 0;
+        this.isProcessingMessage = false;
+        this.sessionModelsMetadata.clear();
+        this.initialAvailableCommands.clear();
+        this.sessionAvailableCommands.clear();
+        this.autoPermissionModeEnabled = null;
+        this.notifyResponseComplete();
+        this.settlePendingElicitations();
+        await this.transport.close();
+        this.transport = null;
+    }
+
+    private handleNotification(method: string, params: unknown): void {
+        if (method === 'session/update') {
+            this.handleSessionUpdate(params);
+        } else if (method === OPENCODE_CHILD_UPDATE_METHOD && this.options.childSessionUpdates) {
+            this.handleChildSessionUpdate(params);
+        } else if (
+            method === '_x.ai/settings/update'
+            && isObject(params)
+            && 'auto_permission_mode_enabled' in params
+        ) {
+            this.autoPermissionModeEnabled = params.auto_permission_mode_enabled === true;
+        }
+    }
+
+    /**
+     * OpenCode v2 child (background subagent) updates. Unlike ordinary
+     * session/update traffic, these never touch the parent's prompt-scoped
+     * `messageHandler`: OpenCode namespaces child tool call ids but not
+     * child text, so routing child text through the parent handler would
+     * merge it into the parent's (or another child's) text buffer, and the
+     * compact window's handler suppression would drop it. Each child gets
+     * its own handler keyed by `childSessionId`, kept across parent prompt
+     * changes, unaffected by `suppressUpdatesDuring` and by abort (OpenCode
+     * keeps children running after a cancelled turn). Emission goes through
+     * the most recent prompt()'s onUpdate; before any prompt has run there
+     * is no sink, so updates are dropped.
+     */
+    private handleChildSessionUpdate(params: unknown): void {
+        if (!isObject(params)) return;
+        // Same root-session guard handleSessionUpdate applies.
+        const rootSessionId = asString(params.rootSessionId);
+        if (this.activeSessionId && rootSessionId && rootSessionId !== this.activeSessionId) {
+            return;
+        }
+        const childSessionId = asString(params.childSessionId);
+        if (!childSessionId) return;
+
+        if (params.type === 'status') {
+            const status = asString(params.status);
+            if (status === 'completed' || status === 'failed' || status === 'interrupted') {
+                this.finishChildHandler(childSessionId);
+            }
+            // created/running have no handler to manage yet.
+            return;
+        }
+        if (params.type !== 'update' || !isObject(params.update)) return;
+
+        const entry = this.childHandlers.get(childSessionId) ?? this.createChildHandler(childSessionId);
+        if (!entry) return;
+        const update = params.update;
+        this.sessionUpdateQueue = this.sessionUpdateQueue
+            .then(async () => {
+                await entry.handler.handleUpdate(update);
+            })
+            .catch((error) => {
+                logger.debug(
+                    '[AcpSdkBackend] child session update failed:',
+                    error instanceof Error ? error.message : String(error)
+                );
+            });
+        this.armChildQuietTimer(childSessionId, entry);
+    }
+
+    private createChildHandler(childSessionId: string): { handler: AcpMessageHandler; timer: ReturnType<typeof setTimeout> | null } | null {
+        if (!this.childEmitSink) {
+            logger.debug('[AcpSdkBackend] dropping child update: no prompt has run yet');
+            return null;
+        }
+        const handler = new AcpMessageHandler((message) => {
+            this.childEmitSink?.(message);
+        }, {
+            textChunkMode: this.options.textChunkMode,
+            flavor: this.options.flavor,
+        });
+        const entry = { handler, timer: null };
+        this.childHandlers.set(childSessionId, entry);
+        return entry;
+    }
+
+    /** Per-child quiet timer: drains that child's buffers once its stream goes quiet. */
+    private armChildQuietTimer(
+        childSessionId: string,
+        entry: { handler: AcpMessageHandler; timer: ReturnType<typeof setTimeout> | null }
+    ): void {
+        if (entry.timer) {
+            clearTimeout(entry.timer);
+        }
+        entry.timer = setTimeout(() => {
+            entry.timer = null;
+            void this.sessionUpdateQueue.then(() => entry.handler.drainBuffers());
+        }, AcpSdkBackend.LATE_FLUSH_QUIET_PERIOD_MS);
+    }
+
+    private clearChildQuietTimer(entry: { handler: AcpMessageHandler; timer: ReturnType<typeof setTimeout> | null }): void {
+        if (entry.timer) {
+            clearTimeout(entry.timer);
+            entry.timer = null;
+        }
+    }
+
+    /** Child turn ended: flush its buffers now and retire its handler and timer. */
+    private finishChildHandler(childSessionId: string): void {
+        const entry = this.childHandlers.get(childSessionId);
+        if (!entry) return;
+        this.childHandlers.delete(childSessionId);
+        this.clearChildQuietTimer(entry);
+        this.sessionUpdateQueue = this.sessionUpdateQueue
+            .then(() => {
+                entry.handler.drainBuffers();
+            })
+            .catch((error) => {
+                logger.debug(
+                    '[AcpSdkBackend] child flush failed:',
+                    error instanceof Error ? error.message : String(error)
+                );
+            });
+    }
+
+    private handleSessionUpdate(params: unknown): void {
+        if (!isObject(params)) return;
+        const sessionId = asString(params.sessionId);
+        if (this.activeSessionId && sessionId && sessionId !== this.activeSessionId) {
+            return;
+        }
+        this.lastSessionUpdateAt = Date.now();
+        const update = params.update;
+        // Title/usage/commands stay synchronous (#1028). Only message-handler
+        // work is queued so async image registration preserves event order.
+        if (sessionId) {
+            this.captureAvailableCommands(sessionId, update);
+        }
+        this.forwardSessionInfoUpdate(sessionId, update);
+        this.captureUsageUpdate(update);
+        this.notifyAgentActivity(update);
+        // Capture the handler at enqueue time. Looking up `this.messageHandler`
+        // when the queued microtask runs can leak a suppressUpdatesDuring
+        // update into the restored handler if earlier async image work kept
+        // the queue busy past restore.
+        const handler = this.messageHandler;
+        const echoedText = this.userMessageChunkListener ? userMessageChunkText(update) : null;
+        this.sessionUpdateQueue = this.sessionUpdateQueue
+            .then(async () => {
+                await handler?.handleUpdate(update);
+                if (echoedText !== null) {
+                    handler?.drainBuffers();
+                    this.userMessageChunkListener?.(echoedText);
+                }
+            })
+            .catch((error) => {
+                logger.debug(
+                    '[AcpSdkBackend] session update failed:',
+                    error instanceof Error ? error.message : String(error)
+                );
+            });
+    }
+
+    private notifyAgentActivity(update: unknown): void {
+        if (!this.agentActivityListener) {
+            return;
+        }
+        if (!isObject(update)) {
+            return;
+        }
+        const hint = thinkingHintFromSessionUpdate(update);
+        if (hint === null) {
+            return;
+        }
+
+        if (hint === false) {
+            this.clearRunningThinkingTimer();
+            // Launcher owns thinking for the duration of prompt(); idle chatter
+            // mid-drain must not clear the spinner before finally runs.
+            if (this.isProcessingMessage) {
+                return;
+            }
+            this.agentActivityListener(false);
+            return;
+        }
+
+        // Sustained running only — Cursor flaps running↔idle while queue-idle (#1502).
+        if (update.sessionUpdate === 'state_update' && update.state === 'running') {
+            if (this.runningThinkingTimer) {
+                return;
+            }
+            this.runningThinkingTimer = setTimeout(() => {
+                this.runningThinkingTimer = null;
+                this.agentActivityListener?.(true);
+            }, AcpSdkBackend.RUNNING_THINKING_DEBOUNCE_MS);
+            return;
+        }
+
+        this.clearRunningThinkingTimer();
+        this.agentActivityListener(true);
+    }
+
+    private clearRunningThinkingTimer(): void {
+        if (this.runningThinkingTimer) {
+            clearTimeout(this.runningThinkingTimer);
+            this.runningThinkingTimer = null;
+        }
+    }
+
+    private forwardSessionInfoUpdate(sessionId: string | null, update: unknown): void {
+        if (!isObject(update) || update.sessionUpdate !== ACP_SESSION_UPDATE_TYPES.sessionInfoUpdate) {
+            return;
+        }
+        if (typeof update.title !== 'string' && update.title !== null) {
+            return;
+        }
+        this.sessionInfoUpdateListener?.({ sessionId, title: update.title });
+    }
+
+    private captureUsageUpdate(update: unknown): void {
+        if (!isObject(update)) return;
+
+        const sessionUpdate = asString(update.sessionUpdate);
+        let contextTokens: number | null = null;
+        let contextWindow: number | null = null;
+
+        if (sessionUpdate === ACP_SESSION_UPDATE_TYPES.usageUpdate) {
+            contextTokens = this.asFiniteNumber(update.used);
+            contextWindow = this.asFiniteNumber(update.size);
+        } else if (sessionUpdate === ACP_SESSION_UPDATE_TYPES.sessionInfoUpdate) {
+            contextTokens = this.asFiniteNumber(
+                update.used
+                ?? update.contextTokens
+                ?? update.context_tokens
+                ?? update.contextUsed
+            );
+            contextWindow = this.asFiniteNumber(
+                update.size
+                ?? update.contextWindow
+                ?? update.context_window
+                ?? update.contextLimit
+            );
+        } else {
+            return;
+        }
+
+        this.latestUsageUpdate = {
+            contextTokens: contextTokens ?? undefined,
+            contextWindow: contextWindow ?? undefined
+        };
+        this.forwardUsageUpdate();
+    }
+
+    private hasForwardedUsage(update: AcpUsageUpdate): boolean {
+        return this.lastForwardedUsageUpdate !== null
+            && this.lastForwardedUsageUpdate.contextTokens === update.contextTokens
+            && this.lastForwardedUsageUpdate.contextWindow === update.contextWindow;
+    }
+
+    private forwardUsageUpdate(): void {
+        const update = this.latestUsageUpdate;
+        if (
+            !update
+            || (update.contextTokens === undefined && update.contextWindow === undefined)
+        ) {
+            return;
+        }
+
+        if (
+            this.lastForwardedUsageUpdate
+            && this.lastForwardedUsageUpdate.contextTokens === update.contextTokens
+            && this.lastForwardedUsageUpdate.contextWindow === update.contextWindow
+        ) {
+            return;
+        }
+
+        this.lastForwardedUsageUpdate = update;
+        const message: AgentMessage = {
+            type: 'usage',
+            inputTokens: 0,
+            outputTokens: 0,
+            contextTokens: update.contextTokens,
+            contextWindow: update.contextWindow
+        };
+
+        if (this.promptUsageCallback) {
+            this.promptUsageCallback(message);
+        } else if (this.usageUpdateListener) {
+            this.usageUpdateListener(message);
+        }
+    }
+
+    private readLatestUsageUpdate(): AcpUsageUpdate | null {
+        return this.latestUsageUpdate;
+    }
+
+    /**
+     * Poll drainBuffers() on a short interval until the model has been quiet
+     * for LATE_FLUSH_QUIET_PERIOD_MS or LATE_FLUSH_WINDOW_MS elapses. Polling
+     * keeps the UI streaming smoothly while we wait; the quiet-window check
+     * lets fast models exit almost immediately (Claude tail typically < 100ms)
+     * while still bounding slow-tailing models (GPT-5.5, DeepSeek V4 Pro).
+     *
+     * The quiet measurement is anchored to entry time, not just
+     * lastSessionUpdateAt: if session/prompt paused mid-turn (chunks → pause
+     * → stopReason), lastSessionUpdateAt is already stale on entry and we
+     * would otherwise exit immediately, missing any straggler that arrives
+     * just after session/prompt resolves.
+     */
+    private async drainLateBuffers(): Promise<void> {
+        const quietBaseline = Date.now();
+        const deadline = quietBaseline + AcpSdkBackend.LATE_FLUSH_WINDOW_MS;
+        while (Date.now() < deadline) {
+            const latestActivityAt = Math.max(this.lastSessionUpdateAt, quietBaseline);
+            const elapsedSinceUpdate = Date.now() - latestActivityAt;
+            if (elapsedSinceUpdate >= AcpSdkBackend.LATE_FLUSH_QUIET_PERIOD_MS) {
+                return;
+            }
+            const remainingBudget = deadline - Date.now();
+            const waitMs = Math.max(1, Math.min(AcpSdkBackend.LATE_FLUSH_INTERVAL_MS, remainingBudget));
+            await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+            this.messageHandler?.drainBuffers();
+        }
+    }
+
+    private async waitForSessionUpdateQuiet(quietMs: number, timeoutMs: number): Promise<void> {
+        if (quietMs <= 0 || timeoutMs <= 0) {
+            return;
+        }
+
+        const deadline = Date.now() + timeoutMs;
+
+        while (Date.now() < deadline) {
+            const elapsedSinceUpdate = Date.now() - this.lastSessionUpdateAt;
+            if (elapsedSinceUpdate >= quietMs) {
+                return;
+            }
+
+            const remainingToQuiet = quietMs - elapsedSinceUpdate;
+            const remainingBudget = deadline - Date.now();
+            const waitMs = Math.max(1, Math.min(remainingToQuiet, remainingBudget));
+            await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+        }
+    }
+
+    private async handlePermissionRequest(params: unknown, requestId: string | number | null): Promise<unknown> {
+        if (!isObject(params)) {
+            return { outcome: { outcome: 'cancelled' } };
+        }
+
+        const sessionId = asString(params.sessionId) ?? this.activeSessionId ?? 'unknown';
+        const toolCall = isObject(params.toolCall) ? params.toolCall : {};
+        const toolCallId = asString(toolCall.toolCallId) ?? `tool-${Date.now()}`;
+        const title = asString(toolCall.title) ?? undefined;
+        const kind = asString(toolCall.kind) ?? undefined;
+        const rawInput = 'rawInput' in toolCall ? toolCall.rawInput : undefined;
+        const rawOutput = 'rawOutput' in toolCall ? toolCall.rawOutput : undefined;
+        const options = Array.isArray(params.options)
+            ? params.options
+                .filter((option) => isObject(option))
+                .map((option, index) => ({
+                    optionId: asString(option.optionId) ?? `option-${index + 1}`,
+                    name: asString(option.name) ?? `Option ${index + 1}`,
+                    kind: asString(option.kind) ?? 'allow_once'
+                }))
+            : [];
+
+        const request: PermissionRequest = {
+            id: toolCallId,
+            sessionId,
+            toolCallId,
+            title,
+            kind,
+            rawInput,
+            rawOutput,
+            options
+        };
+
+        const responsePromise = new Promise((resolve) => {
+            this.pendingPermissions.set(toolCallId, { resolve });
+        });
+
+        if (this.permissionHandler) {
+            try {
+                // Permission prompts imply the agent is awake (#1470).
+                this.agentActivityListener?.(true);
+                this.permissionHandler(request);
+            } catch (error) {
+                this.pendingPermissions.delete(toolCallId);
+                throw error;
+            }
+        } else {
+            logger.debug('[ACP] No permission handler registered; cancelling request');
+            this.pendingPermissions.delete(toolCallId);
+            return { outcome: { outcome: 'cancelled' } };
+        }
+
+        return await responsePromise;
+    }
+
+    private beginPromptRequest(): number {
+        this.activePromptRequests++;
+        this.isProcessingMessage = true;
+        return this.promptRequestEpoch;
+    }
+
+    /**
+     * Force-settle soft-steer bookkeeping without waiting for the concurrent
+     * `session/prompt` to finish. Called on abort: the in-flight turn is
+     * cancelled anyway, so a pending soft steer may never complete; dropping
+     * its counter keeps {@link waitForResponseComplete} from blocking the next
+     * turn. Bumps the epoch so a stale finish from a cancelled request cannot
+     * decrement a newer prompt's counter.
+     */
+    abortSoftSteers(): void {
+        this.messageHandler?.drainBuffers();
+        this.messageHandler?.deactivate?.();
+        this.promptRequestEpoch++;
+        this.activePromptRequests = this.foregroundPromptRequests;
+        this.isProcessingMessage = this.activePromptRequests > 0;
+        if (!this.isProcessingMessage) {
+            this.notifyResponseComplete();
+        }
+    }
+
+    private finishPromptRequest(epoch: number): void {
+        if (epoch !== this.promptRequestEpoch) {
+            return;
+        }
+        this.activePromptRequests = Math.max(0, this.activePromptRequests - 1);
+        this.isProcessingMessage = this.activePromptRequests > 0;
+        if (!this.isProcessingMessage) {
+            this.notifyResponseComplete();
+        }
+    }
+
+    private notifyResponseComplete(): void {
+        const resolvers = this.responseCompleteResolvers;
+        this.responseCompleteResolvers = [];
+        for (const resolve of resolvers) {
+            resolve();
+        }
+    }
+
+    /**
+     * Optimistically update the cached `currentModelId` for a session after a
+     * successful `session/set_model` call whose response does not echo the
+     * model metadata (OpenCode 1.14.30 returns only `_meta.opencode.modelId`).
+     * The previously captured `availableModels` list is preserved.
+     */
+    private updateCurrentModelOptimistic(sessionId: string, modelId: string): void {
+        const existing = this.sessionModelsMetadata.get(sessionId);
+        this.sessionModelsMetadata.set(sessionId, {
+            availableModels: existing?.availableModels ?? [],
+            currentModelId: modelId
+        });
+    }
+
+    private updateThoughtLevelCurrentValue(sessionId: string, value: string): void {
+        const options = this.sessionConfigOptions.get(sessionId);
+        if (!options) return;
+        this.sessionConfigOptions.set(sessionId, options.map((option) => (
+            option.category === 'thought_level'
+                ? { ...option, currentValue: value }
+                : option
+        )));
+    }
+
+    /** After a successful model config apply, avoid stale base-only ACP currentValue overwriting cache. */
+    pinSessionModelWireId(sessionId: string, modelId: string): void {
+        this.updateCurrentModelOptimistic(sessionId, modelId);
+    }
+
+    private extractPromptUsage(response: unknown): AcpPromptUsage | null {
+        if (!isObject(response) || !isObject(response.usage)) return null;
+        const usage = response.usage;
+        const inputTokens = this.asFiniteNumber(usage.inputTokens ?? usage.input_tokens);
+        const outputTokens = this.asFiniteNumber(usage.outputTokens ?? usage.output_tokens);
+        if (inputTokens === null || outputTokens === null) return null;
+
+        return {
+            inputTokens,
+            outputTokens,
+            totalTokens: this.asFiniteNumber(usage.totalTokens ?? usage.total_tokens) ?? undefined,
+            thoughtTokens: this.asFiniteNumber(usage.thoughtTokens ?? usage.thought_tokens) ?? undefined,
+            cacheReadTokens: this.asFiniteNumber(
+                usage.cachedReadTokens
+                ?? usage.cached_read_tokens
+                ?? usage.cachedInputTokens
+                ?? usage.cached_input_tokens
+            ) ?? undefined,
+            cacheCreationTokens: this.asFiniteNumber(
+                usage.cachedWriteTokens
+                ?? usage.cached_write_tokens
+                ?? usage.cacheCreationInputTokens
+                ?? usage.cache_creation_input_tokens
+            ) ?? undefined
+        };
+    }
+
+    private asFiniteNumber(value: unknown): number | null {
+        return typeof value === 'number' && Number.isFinite(value) ? value : null;
+    }
+
+
+    private captureSessionMetadata(sessionId: string, response: unknown): void {
+        this.captureSessionModelsMetadata(sessionId, response);
+        this.captureSessionConfigOptions(sessionId, response);
+        this.captureAvailableCommands(sessionId, response);
+    }
+
+    private captureAvailableCommands(sessionId: string | null, source: unknown): void {
+        if (!isObject(source)) return;
+
+        const meta = isObject(source._meta) ? source._meta : null;
+        const rawCommands = Array.isArray(source.availableCommands)
+            ? source.availableCommands
+            : meta && Array.isArray(meta.availableCommands)
+                ? meta.availableCommands
+                : null;
+        if (!rawCommands) return;
+
+        const commands = new Set(
+            rawCommands
+                .filter((entry): entry is Record<string, unknown> => isObject(entry))
+                .map((entry) => asString(entry.name) ?? '')
+                .filter((name) => name.length > 0)
+        );
+        if (sessionId) {
+            this.sessionAvailableCommands.set(sessionId, commands);
+            return;
+        }
+
+        this.initialAvailableCommands.clear();
+        for (const command of commands) {
+            this.initialAvailableCommands.add(command);
+        }
+    }
+
+    private captureSessionConfigOptions(sessionId: string, response: unknown): void {
+        if (!isObject(response)) return;
+
+        const options = (Array.isArray(response.configOptions) ? response.configOptions : [])
+            .filter((entry): entry is Record<string, unknown> => isObject(entry))
+            .map((entry): AcpConfigOptionDescriptor | null => {
+                const id = asString(entry.id);
+                if (!id) return null;
+                const rawOptions = Array.isArray(entry.options) ? entry.options : [];
+                return {
+                    id,
+                    category: asString(entry.category) ?? undefined,
+                    currentValue: asString(entry.currentValue) ?? undefined,
+                    options: flattenConfigOptionChoices(rawOptions)
+                };
+            })
+            .filter((entry): entry is AcpConfigOptionDescriptor => entry !== null);
+
+        const meta = isObject(response._meta) ? response._meta : null;
+        const xaiConfig = meta && isObject(meta['x.ai/sessionConfig'])
+            ? meta['x.ai/sessionConfig']
+            : null;
+        const xaiOptions = xaiConfig && Array.isArray(xaiConfig.options)
+            ? xaiConfig.options.filter((entry): entry is Record<string, unknown> => isObject(entry))
+            : [];
+        const effortOptions = xaiOptions
+            .filter((entry) => asString(entry.category) === 'mode')
+            .map((entry) => ({
+                value: asString(entry.id) ?? '',
+                name: asString(entry.label) ?? undefined,
+                selected: entry.selected === true
+            }))
+            .filter((entry) => entry.value.length > 0);
+        if (effortOptions.length > 0) {
+            options.push({
+                id: 'x.ai/reasoning-effort',
+                category: 'thought_level',
+                currentValue: effortOptions.find((entry) => entry.selected)?.value,
+                options: effortOptions.map(({ value, name }) => ({ value, name }))
+            });
+        }
+
+        if (options.length > 0) {
+            this.sessionConfigOptions.set(sessionId, options);
+        }
+    }
+
+    /**
+     * Extract `availableModels` and `currentModelId` from an ACP response and
+     * store them keyed by sessionId. Both top-level and nested-under-`models`
+     * shapes are accepted because different agents use different conventions.
+     * Missing or malformed fields are silently ignored — flavors that do not
+     * expose model metadata (e.g. current Gemini ACP build) simply leave the
+     * cache untouched.
+     */
+    private extractModelConfigOption(response: Record<string, unknown>): {
+        currentValue: string | null;
+        options: unknown[];
+    } | null {
+        if (!Array.isArray(response.configOptions)) return null;
+
+        for (const entry of response.configOptions) {
+            if (!isObject(entry)) continue;
+            if (asString(entry.category) !== 'model' && asString(entry.id) !== 'model') continue;
+            return {
+                currentValue: asString(entry.currentValue),
+                options: Array.isArray(entry.options) ? entry.options : []
+            };
+        }
+
+        return null;
+    }
+
+    private captureSessionModelsMetadata(sessionId: string, response: unknown): void {
+        if (!isObject(response)) return;
+
+        const directList = response.availableModels;
+        const directCurrent = response.currentModelId;
+        const nested = isObject(response.models) ? response.models : null;
+        const nestedList = nested?.availableModels;
+        const nestedCurrent = nested?.currentModelId;
+
+        const configModelOption = this.extractModelConfigOption(response);
+        const rawModels = Array.isArray(directList)
+            ? directList
+            : Array.isArray(nestedList)
+                ? nestedList
+                : configModelOption?.options ?? null;
+        const rawCurrent = typeof directCurrent === 'string'
+            ? directCurrent
+            : typeof nestedCurrent === 'string'
+                ? nestedCurrent
+                : configModelOption?.currentValue ?? null;
+
+        if (rawModels === null && rawCurrent === null) {
+            return;
+        }
+
+        const byModelId = new Map<string, AcpModelDescriptor>();
+        const addModel = (
+            modelId: string,
+            name?: string,
+            reasoningEfforts?: AcpModelDescriptor['reasoningEfforts']
+        ) => {
+            const trimmedId = modelId.trim();
+            if (!trimmedId) return;
+            const trimmedName = name?.trim();
+            const existing = byModelId.get(trimmedId);
+            if (!existing) {
+                byModelId.set(
+                    trimmedId,
+                    trimmedName && trimmedName !== trimmedId
+                        ? { modelId: trimmedId, name: trimmedName, ...(reasoningEfforts ? { reasoningEfforts } : {}) }
+                        : { modelId: trimmedId, ...(reasoningEfforts ? { reasoningEfforts } : {}) }
+                );
+                return;
+            }
+            if (!existing.name && trimmedName && trimmedName !== trimmedId) {
+                byModelId.set(trimmedId, { ...existing, name: trimmedName });
+            }
+        };
+
+        if (Array.isArray(rawModels)) {
+            for (const entry of rawModels) {
+                if (!isObject(entry)) continue;
+                const modelId = asString(entry.modelId) ?? asString(entry.value);
+                if (!modelId) continue;
+                const meta = isObject(entry._meta) ? entry._meta : null;
+                const reasoningEfforts = meta && Array.isArray(meta.reasoningEfforts)
+                    ? meta.reasoningEfforts
+                        .filter((effort): effort is Record<string, unknown> => isObject(effort))
+                        .map((effort) => ({
+                            value: asString(effort.value) ?? asString(effort.id) ?? '',
+                            name: asString(effort.label) ?? undefined,
+                            isDefault: effort.default === true
+                        }))
+                        .filter((effort) => effort.value.length > 0)
+                    : undefined;
+                addModel(modelId, asString(entry.name) ?? undefined, reasoningEfforts);
+            }
+        } else {
+            // Preserve previously-captured availableModels when the response only
+            // updates currentModelId (e.g. a setModel response from some agents).
+            const existing = this.sessionModelsMetadata.get(sessionId);
+            for (const entry of existing?.availableModels ?? []) {
+                addModel(entry.modelId, entry.name, entry.reasoningEfforts);
+            }
+        }
+
+        // Cursor often lists one wire id per family in `models` but every variant in
+        // `configOptions` category=model — merge so metadata matches Zed-style pickers.
+        // Flatten handles both flat choices and Zed-style grouped ones (dsh).
+        if (configModelOption) {
+            for (const entry of flattenConfigOptionChoices(configModelOption.options)) {
+                addModel(entry.value, entry.name);
+            }
+        }
+
+        const existing = this.sessionModelsMetadata.get(sessionId);
+        const currentModelId = this.preferSpecificCursorWireId(
+            rawCurrent,
+            existing?.currentModelId ?? null
+        );
+
+        this.sessionModelsMetadata.set(sessionId, {
+            availableModels: [...byModelId.values()],
+            currentModelId
+        });
+    }
+
+    private preferSpecificCursorWireId(
+        incoming: string | null,
+        existing: string | null
+    ): string | null {
+        if (!incoming) {
+            return existing;
+        }
+        if (!existing) {
+            return incoming;
+        }
+
+        const incomingBase = incoming.split('[')[0];
+        const existingBase = existing.split('[')[0];
+        if (incomingBase !== existingBase) {
+            return incoming;
+        }
+
+        const incomingHasVariant = incoming.includes('[');
+        const existingHasVariant = existing.includes('[');
+        if (!incomingHasVariant && existingHasVariant) {
+            return existing;
+        }
+
+        return incoming;
+    }
+}
