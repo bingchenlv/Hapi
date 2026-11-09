@@ -347,6 +347,10 @@ export class CodexAppServerClient extends JsonLineParser {
         return await this.sendRequest(method, params, { timeoutMs: 20_000 }) as T;
     }
 
+    async readRateLimits(): Promise<unknown> {
+        return await this.sendRequest('account/rateLimits/read', {}, { timeoutMs: 5_000 });
+    }
+
     async initialize(params: InitializeParams): Promise<InitializeResponse> {
         const response = await this.sendRequest('initialize', params, { timeoutMs: 30_000 });
         this.sendNotification('initialized');

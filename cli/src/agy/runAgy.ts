@@ -13,7 +13,7 @@ import { registerSessionConfigRpc } from '@/agent/sessionConfigRpc';
 import { formatMessageWithAttachments } from '@/utils/attachmentFormatter';
 import { getInvokedCwd } from '@/utils/invokedCwd';
 import type { SessionEffort, SessionModel } from '@/api/types';
-import { splitAgyModelSelection } from '@hapi/protocol';
+import { SessionProjectSchema, splitAgyModelSelection } from '@hapi/protocol';
 import { listAgyModels } from '@/modules/common/agyModels';
 import { normalizeAgyModelSelection } from './utils/agyModelSelection';
 
@@ -31,6 +31,9 @@ export async function runAgy(opts: {
 } = {}): Promise<void> {
     const workingDirectory = opts.workingDirectory ?? getInvokedCwd();
     const startedBy = opts.startedBy ?? 'terminal';
+    const sessionProject = process.env.HAPI_SESSION_PROJECT
+        ? SessionProjectSchema.parse(JSON.parse(process.env.HAPI_SESSION_PROJECT))
+        : undefined;
 
     logger.debug(`[agy] Starting with options: startedBy=${startedBy}, startingMode=${opts.startingMode}`);
 
@@ -59,8 +62,9 @@ export async function runAgy(opts: {
             tag: `__hapi_agy_${randomUUID()}`,
             agentState: initialState,
             model: initialModel ?? undefined,
-            effort: opts.effort,
-            reservedSessionId: opts.reservedSessionId
+            effort: opts.effort ?? undefined,
+            reservedSessionId: opts.reservedSessionId,
+            metadataOverrides: sessionProject ? { project: sessionProject } : undefined
         });
     const { api, session } = bootstrap;
 

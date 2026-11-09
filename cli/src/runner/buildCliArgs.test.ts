@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildCliArgs, classifyRecoveredProcessGeneration, createSpawnDeduplicator, probeRecoveredProcessGeneration, releaseRecoveredSpawnDedupe } from './run'
+import { buildCliArgs, classifyRecoveredProcessGeneration, createSpawnDeduplicator, probeRecoveredProcessGeneration, releaseRecoveredSpawnDedupe, releaseArchivedSharedResume, handleArchivedSharedWebhook, createArchivedRootRegistry, decideSharedRootAction, applySharedRootWebhook, reconcileArchivedSharedResume } from './run'
 
 describe('buildCliArgs', () => {
     it('adds --permission-mode for valid permission mode', () => {
@@ -615,6 +615,371 @@ describe('releaseRecoveredSpawnDedupe', () => {
     })
 })
 
+describe('shared root archive spawn lifecycle', () => {
+    function fixture() {
+        const calls: string[] = []
+        const spawn = createSpawnDeduplicator(async options => {
+            calls.push(options.existingSessionId!)
+            return { type: 'success' as const, sessionId: options.existingSessionId! }
+        })
+        spawn.recoverChild('primary', { type: 'success', sessionId: 'primary' })
+        spawn.recoverChild('other-runtime-root', { type: 'success', sessionId: 'other-runtime-root' })
+        return { calls, options: {
+            pid: 123, sessionId: 'primary', spawn,
+            tracked: { happySessionId: 'primary', requestedHappySessionId: 'primary',
+                primaryAckRetired: undefined as boolean | undefined },
+            childOwners: new Map([[123, 'primary']]),
+            persisted: new Map<number, { requestedSessionId: string; confirmedSessionId?: string }>([[123, { requestedSessionId: 'primary', confirmedSessionId: 'primary' }]]),
+            requested: new Map([[123, 'primary']]), confirmed: new Map([[123, 'primary']])
+        } }
+    }
+    it('allows a fresh same-row resume after the primary archives while its wrapper survives', async () => {
+        const f = fixture()
+        expect(releaseArchivedSharedResume(f.options)).toBe(true)
+        await f.options.spawn({ directory: '/tmp', existingSessionId: 'primary' })
+        await f.options.spawn({ directory: '/tmp', existingSessionId: 'other-runtime-root' })
+        expect(f.calls).toEqual(['primary'])
+        expect(f.options.persisted.size).toBe(0)
+        expect(f.options.childOwners.size).toBe(0)
+        expect(f.options.requested.size).toBe(0)
+        expect(f.options.confirmed.size).toBe(0)
+        expect(f.options.tracked.happySessionId).toBeUndefined()
+        expect(f.options.tracked.primaryAckRetired).toBe(true)
+    })
+    it('does not release the primary acknowledgement when only a sibling archives', async () => {
+        const f = fixture()
+        expect(releaseArchivedSharedResume({ ...f.options, sessionId: 'sibling' })).toBe(false)
+        await f.options.spawn({ directory: '/tmp', existingSessionId: 'primary' })
+        expect(f.calls).toEqual([])
+        expect(f.options.persisted.size).toBe(1)
+        expect(f.options.tracked.happySessionId).toBe('primary')
+        // A sibling that archives does not retire the primary acknowledgement.
+        expect(f.options.tracked.primaryAckRetired).toBeUndefined()
+    })
+    it('retires the original requested key when the confirmed HAPI identity differs', async () => {
+        const f = fixture()
+        f.options.persisted.set(123, { requestedSessionId: 'primary', confirmedSessionId: 'confirmed' })
+        expect(releaseArchivedSharedResume({ ...f.options, sessionId: 'confirmed' })).toBe(true)
+        await f.options.spawn({ directory: '/tmp', existingSessionId: 'primary' })
+        expect(f.calls).toEqual(['primary'])
+        expect(f.options.persisted.size).toBe(0)
+        expect(f.options.tracked.happySessionId).toBeUndefined()
+    })
+})
+
+
+describe('archived shared root regressions', () => {
+    function fixture() {
+        const calls: string[] = []
+        const spawn = createSpawnDeduplicator(async options => {
+            calls.push(options.existingSessionId!)
+            return { type: 'success' as const, sessionId: options.existingSessionId! }
+        })
+        spawn.recoverChild('primary', { type: 'success', sessionId: 'primary' })
+        spawn.recoverChild('other-runtime-root', { type: 'success', sessionId: 'other-runtime-root' })
+        return { calls, options: {
+            pid: 123, sessionId: 'primary', spawn,
+            tracked: { happySessionId: 'primary', requestedHappySessionId: 'primary' },
+            childOwners: new Map([[123, 'primary']]),
+            persisted: new Map<number, { requestedSessionId: string; confirmedSessionId?: string }>([[123, { requestedSessionId: 'primary', confirmedSessionId: 'primary' }]]),
+            requested: new Map([[123, 'primary']]), confirmed: new Map([[123, 'primary']])
+        } }
+    }
+
+    it('retires the acknowledgement when only the confirmed alias is known and no durable record exists', async () => {
+        const f = fixture()
+        f.options.persisted.delete(123)
+        f.options.confirmed.set(123, 'confirmed')
+        f.options.tracked.happySessionId = 'confirmed'
+        expect(releaseArchivedSharedResume({ ...f.options, sessionId: 'confirmed' })).toBe(true)
+        await f.options.spawn({ directory: '/tmp', existingSessionId: 'primary' })
+        expect(f.calls).toEqual(['primary'])
+        expect(f.options.persisted.size).toBe(0)
+        expect(f.options.tracked.happySessionId).toBeUndefined()
+    })
+
+    it('ignores a confirmed alias that is not proven to belong to this child', () => {
+        const f = fixture()
+        f.options.persisted.delete(123)
+        f.options.confirmed.set(123, 'sibling-root')
+        f.options.tracked.happySessionId = 'primary'
+        expect(releaseArchivedSharedResume({ ...f.options, sessionId: 'sibling-root' })).toBe(false)
+        expect(f.options.childOwners.get(123)).toBe('primary')
+        expect(f.options.requested.get(123)).toBe('primary')
+    })
+
+    it('is idempotent for a repeated archived webhook', () => {
+        const f = fixture()
+        expect(releaseArchivedSharedResume(f.options)).toBe(true)
+        expect(releaseArchivedSharedResume(f.options)).toBe(false)
+        expect(f.options.persisted.size).toBe(0)
+        expect(f.options.childOwners.size).toBe(0)
+        expect(f.options.requested.size).toBe(0)
+        expect(f.options.confirmed.size).toBe(0)
+    })
+
+    it('does not mutate anything when a sibling archives after the primary already archived', () => {
+        const f = fixture()
+        expect(releaseArchivedSharedResume(f.options)).toBe(true)
+        expect(releaseArchivedSharedResume({ ...f.options, sessionId: 'sibling' })).toBe(false)
+        expect(f.options.persisted.size).toBe(0)
+        expect(f.options.childOwners.size).toBe(0)
+    })
+
+    it('keeps the bookkeeping of an unrelated pid intact', async () => {
+        const f = fixture()
+        f.options.childOwners.set(456, 'other-runtime-root')
+        f.options.persisted.set(456, { requestedSessionId: 'other-runtime-root' })
+        expect(releaseArchivedSharedResume(f.options)).toBe(true)
+        expect(f.options.childOwners.get(456)).toBe('other-runtime-root')
+        await f.options.spawn({ directory: '/tmp', existingSessionId: 'other-runtime-root' })
+        expect(f.calls).toEqual([])
+    })
+
+    it('clears both tracked aliases for the archived root', () => {
+        const f = fixture()
+        expect(releaseArchivedSharedResume(f.options)).toBe(true)
+        expect(f.options.tracked.happySessionId).toBeUndefined()
+        expect(f.options.tracked.requestedHappySessionId).toBeUndefined()
+    })
+
+    it('replays a fresh spawn result instead of the cached acknowledgement', async () => {
+        const calls: string[] = []
+        const spawn = createSpawnDeduplicator(async options => {
+            calls.push(options.existingSessionId!)
+            return { type: 'success' as const, sessionId: `${options.existingSessionId}-gen2` }
+        })
+        spawn.recoverChild('primary', { type: 'success', sessionId: 'primary' })
+        const maps = {
+            pid: 123, sessionId: 'primary', spawn,
+            tracked: { happySessionId: 'primary', requestedHappySessionId: 'primary' },
+            childOwners: new Map([[123, 'primary']]),
+            persisted: new Map<number, { requestedSessionId: string; confirmedSessionId?: string }>([[123, { requestedSessionId: 'primary', confirmedSessionId: 'primary' }]]),
+            requested: new Map([[123, 'primary']]), confirmed: new Map([[123, 'primary']])
+        }
+        expect(releaseArchivedSharedResume(maps)).toBe(true)
+        await expect(spawn({ directory: '/tmp', existingSessionId: 'primary' }))
+            .resolves.toEqual({ type: 'success', sessionId: 'primary-gen2' })
+        expect(calls).toEqual(['primary'])
+    })
+
+    it('consumes and releases an archived root for a restart-recovered child', () => {
+        const f = fixture()
+        f.options.persisted.set(123, { requestedSessionId: 'primary', confirmedSessionId: 'confirmed' })
+        const result = handleArchivedSharedWebhook({
+            pid: 123, sessionId: 'confirmed', spawn: f.options.spawn,
+            childOwners: f.options.childOwners,
+            persisted: f.options.persisted,
+            requested: f.options.requested,
+            confirmed: f.options.confirmed
+        })
+        expect(result.consumed).toBe(true)
+        expect(result.released).toBe(true)
+        expect(f.options.persisted.size).toBe(0)
+        expect(f.options.childOwners.size).toBe(0)
+    })
+
+    it('does not consume an archived webhook for a pid that is not a known runner child', () => {
+        const spawn = createSpawnDeduplicator(async () => ({ type: 'success' as const, sessionId: 'external' }))
+        const result = handleArchivedSharedWebhook({
+            pid: 999, sessionId: 'external-root', spawn,
+            childOwners: new Map(), persisted: new Map(), requested: new Map(), confirmed: new Map()
+        })
+        expect(result.consumed).toBe(false)
+        expect(result.released).toBe(false)
+    })
+
+    it('remembers archived roots per pid and forgets them on demand', () => {
+        const registry = createArchivedRootRegistry()
+        expect(registry.isArchived(1, 'root-a')).toBe(false)
+        registry.mark(1, 'root-a')
+        expect(registry.isArchived(1, 'root-a')).toBe(true)
+        expect(registry.isArchived(1, 'root-b')).toBe(false)
+        expect(registry.isArchived(2, 'root-a')).toBe(false)
+        registry.forget(1)
+        expect(registry.isArchived(1, 'root-a')).toBe(false)
+    })
+
+    it('classifies shared root webhooks', () => {
+        expect(decideSharedRootAction({ sessionId: 'r', lifecycleState: 'archived', archivedRoot: false, primaryId: 'r' })).toBe('archive')
+        expect(decideSharedRootAction({ sessionId: 'r', lifecycleState: 'active', archivedRoot: true, primaryId: 'r' })).toBe('ignore-late')
+        expect(decideSharedRootAction({ sessionId: 's', lifecycleState: 'active', archivedRoot: false, primaryId: 'p' })).toBe('ignore-secondary')
+        expect(decideSharedRootAction({ sessionId: 'p', lifecycleState: 'active', archivedRoot: false, primaryId: 'p' })).toBe('promote')
+        expect(decideSharedRootAction({ sessionId: 'p', archivedRoot: false, primaryId: undefined })).toBe('promote')
+    })
+
+    it('does not re-promote a root that already reported archived', () => {
+        const registry = createArchivedRootRegistry()
+        registry.mark(123, 'primary')
+        const action = decideSharedRootAction({
+            sessionId: 'primary', lifecycleState: 'active',
+            archivedRoot: registry.isArchived(123, 'primary'), primaryId: undefined
+        })
+        expect(action).toBe('ignore-late')
+    })
+})
+
+
+describe('Runner shared webhook dispatch', () => {
+    function fixture(recovered = false) {
+        let spawns = 0, persists = 0
+        const spawn = createSpawnDeduplicator(async () => {
+            spawns += 1
+            await new Promise(resolve => setTimeout(resolve, 5))
+            return { type: 'success' as const, sessionId: 'primary-gen2' }
+        })
+        spawn.recoverChild('primary', { type: 'success', sessionId: 'primary' })
+        const tracked = recovered ? undefined : {
+            pid: 123, startedBy: 'runner', happySessionId: 'primary' as string | undefined,
+            requestedHappySessionId: 'primary' as string | undefined,
+            primaryAckRetired: undefined as boolean | undefined,
+            sharedSessions: { primary: {}, sibling: {} } as Record<string, any>,
+        }
+        const base = {
+            pid: 123, sessionId: 'primary', tracked, spawn,
+            childOwners: new Map([[123, 'primary']]),
+            persisted: new Map<number, { requestedSessionId: string; confirmedSessionId?: string }>([[123, { requestedSessionId: 'primary', confirmedSessionId: 'primary' }]]),
+            requested: new Map([[123, 'primary']]), confirmed: new Map([[123, 'primary']]),
+            archivedRoots: createArchivedRootRegistry(), persist: () => { persists += 1 }, invalidate: () => {},
+        }
+        const send = (sessionId: string, lifecycleState: string) => applySharedRootWebhook({
+            ...base, sessionId, metadata: { lifecycleState, capabilities: { concurrentClients: true } },
+        })
+        return { base, send, counts: () => ({ spawns, persists }) }
+    }
+    it('archives the primary, preserves its sibling and deduplicates concurrent fresh resumes', async () => {
+        const f = fixture()
+        expect(f.send('primary', 'archived')).toBe(true)
+        expect(Object.keys(f.base.tracked!.sharedSessions)).toEqual(['sibling'])
+        expect(f.base.tracked!.happySessionId).toBeUndefined()
+        const results = await Promise.all([1, 2].map(() => f.base.spawn({ directory: '/tmp', existingSessionId: 'primary' })))
+        expect(results).toEqual([{ type: 'success', sessionId: 'primary-gen2' }, { type: 'success', sessionId: 'primary-gen2' }])
+        expect(f.counts()).toEqual({ spawns: 1, persists: 1 })
+        expect(f.send('primary', 'archived')).toBe(true)
+        expect(f.counts().persists).toBe(1)
+        expect(f.send('primary', 'running')).toBe(true)
+        expect(f.base.tracked!.sharedSessions.primary).toBeUndefined()
+        expect(f.send('sibling', 'running')).toBe(true)
+        expect(f.base.confirmed.size).toBe(0)
+    })
+    it('accepts the first webhook of a new child that has no preallocated HAPI identity', () => {
+        const f = fixture()
+        // A first-time creation has neither a requested nor a confirmed
+        // identity. Its first valid root webhook must still be confirmed, or
+        // the spawn awaiter times out and kills a healthy process.
+        f.base.tracked!.happySessionId = undefined
+        f.base.tracked!.requestedHappySessionId = undefined
+        f.base.tracked!.sharedSessions = {}
+        f.base.childOwners.clear(); f.base.persisted.clear(); f.base.requested.clear(); f.base.confirmed.clear()
+        expect(f.send('new-primary', 'running')).toBe(false)
+        expect(f.base.tracked!.sharedSessions['new-primary']).toBeDefined()
+        expect(f.base.tracked!.primaryAckRetired).toBeUndefined()
+        // The generic handler then binds the primary and resolves the awaiter.
+        f.base.tracked!.happySessionId = 'new-primary'
+        f.base.confirmed.set(123, 'new-primary')
+        // A sibling must not take over the acknowledgement.
+        expect(f.send('sibling', 'running')).toBe(true)
+        expect(f.base.confirmed.get(123)).toBe('new-primary')
+        // Archiving the primary retires the acknowledgement explicitly.
+        expect(f.send('new-primary', 'archived')).toBe(true)
+        expect(f.base.tracked!.happySessionId).toBeUndefined()
+        expect(f.base.tracked!.primaryAckRetired).toBe(true)
+        // A late sibling keeps the wrapper alive but never reclaims the ACK:
+        // the confirmed alias was released together with the retired ACK.
+        expect(f.send('sibling', 'running')).toBe(true)
+        expect(f.base.tracked!.sharedSessions['sibling']).toBeDefined()
+        expect(f.base.confirmed.size).toBe(0)
+    })
+    it('keeps the acknowledgement of a child that never received one', () => {
+        const f = fixture()
+        f.base.tracked!.happySessionId = undefined
+        f.base.tracked!.requestedHappySessionId = undefined
+        f.base.tracked!.sharedSessions = {}
+        // The archived webhook does not belong to this child, so nothing is
+        // retired and the pending first confirmation stays possible.
+        expect(f.send('foreign-root', 'archived')).toBe(true)
+        expect(f.base.tracked!.primaryAckRetired).toBeUndefined()
+        expect(f.send('new-primary', 'running')).toBe(false)
+        expect(f.base.tracked!.primaryAckRetired).toBeUndefined()
+    })
+    it('releases recovered bookkeeping without a tracked child or stale replay', async () => {
+        const f = fixture(true)
+        expect(f.send('primary', 'archived')).toBe(true)
+        expect(f.base.persisted.size).toBe(0)
+        await expect(f.base.spawn({ directory: '/tmp', existingSessionId: 'primary' }))
+            .resolves.toEqual({ type: 'success', sessionId: 'primary-gen2' })
+        expect(f.counts()).toEqual({ spawns: 1, persists: 1 })
+        expect(f.send('primary', 'running')).toBe(true)
+    })
+    it('does not release the primary when a sibling archives', async () => {
+        const f = fixture()
+        expect(f.send('sibling', 'archived')).toBe(true)
+        await f.base.spawn({ directory: '/tmp', existingSessionId: 'primary' })
+        expect(f.counts()).toEqual({ spawns: 0, persists: 0 })
+        expect(f.base.tracked!.happySessionId).toBe('primary')
+    })
+    it('never adopts an archived unknown or external root as online', () => {
+        const f = fixture(true)
+        expect(applySharedRootWebhook({ ...f.base, pid: 999, sessionId: 'external',
+            metadata: { lifecycleState: 'archived', capabilities: { concurrentClients: true } } })).toBe(true)
+        expect(f.base.archivedRoots.isArchived(999, 'external')).toBe(true)
+        expect(f.counts().persists).toBe(0)
+    })
+    it('accepts an explicit newer activation in the same wrapper but ignores earlier delayed events', () => {
+        const f = fixture()
+        const send = (lifecycleState: string, lifecycleStateSince: number) => applySharedRootWebhook({ ...f.base,
+            metadata: { lifecycleState, lifecycleStateSince, capabilities: { concurrentClients: true } } })
+        expect(send('running', 100)).toBe(false)
+        expect(send('archived', 100)).toBe(true)
+        expect(send('running', 100)).toBe(true)
+        expect(f.base.tracked!.sharedSessions.primary).toBeUndefined()
+        expect(send('running', 200)).toBe(true) // Root listed, without reclaiming retired process ACK.
+        expect(f.base.tracked!.sharedSessions.primary.lifecycleStateSince).toBe(200)
+        expect(send('archived', 100)).toBe(true)
+        expect(f.base.tracked!.sharedSessions.primary.lifecycleStateSince).toBe(200)
+        expect(f.counts().persists).toBe(1)
+    })
+
+})
+
+
+describe('explicit resume before delayed archive webhook', () => {
+    function fixture() {
+        const owners = new Map([[123, 'primary']])
+        const record = { pid: 123, marker: 'generation', hub: 'local', authHash: 'account',
+            sessions: { primary: { active: false }, sibling: { active: true } }, pendingCreations: [] as string[] }
+        const retired: number[] = []
+        const options = { sessionId: 'primary', owners, records: [record], hub: 'local', authHash: 'account',
+            isLive: () => true, archive: (pid: number) => { retired.push(pid); owners.delete(pid) } }
+        return { options, record, retired }
+    }
+    it('retires only the explicitly inactive root and is idempotent for simultaneous resumes', () => {
+        const f = fixture()
+        expect(reconcileArchivedSharedResume(f.options)).toBe(true)
+        expect(reconcileArchivedSharedResume(f.options)).toBe(false)
+        expect(f.retired).toEqual([123])
+        expect(f.record.sessions.sibling.active).toBe(true)
+    })
+    it('keeps a live root and an unconfirmed creation deduplicated', () => {
+        const f = fixture()
+        f.record.sessions.primary.active = true
+        expect(reconcileArchivedSharedResume(f.options)).toBe(false)
+        f.record.sessions.primary.active = false
+        f.record.pendingCreations.push('unconfirmed')
+        expect(reconcileArchivedSharedResume(f.options)).toBe(false)
+        expect(f.retired).toEqual([])
+    })
+    it('does not infer archive from absent, foreign, reused or ambiguous ownership', () => {
+        const f = fixture()
+        expect(reconcileArchivedSharedResume({ ...f.options, records: [] })).toBe(false)
+        expect(reconcileArchivedSharedResume({ ...f.options, hub: 'foreign' })).toBe(false)
+        expect(reconcileArchivedSharedResume({ ...f.options, authHash: 'foreign' })).toBe(false)
+        expect(reconcileArchivedSharedResume({ ...f.options, isLive: () => false })).toBe(false)
+        f.options.owners.set(456, 'primary')
+        expect(reconcileArchivedSharedResume(f.options)).toBe(false)
+        expect(f.retired).toEqual([])
+    })
+})
 
 describe.skipIf(process.platform !== 'linux')('Linux recovered process generation', () => {
     it('releases a legacy PID actually occupied by a live non-leader thread', () => {

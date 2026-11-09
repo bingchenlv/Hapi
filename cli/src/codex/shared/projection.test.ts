@@ -9,6 +9,39 @@ import { extractNotifySummary } from '@hapi/protocol/messages';
 import { asyncQuestionsForItem } from './asyncQuestions';
 
 describe('shared history projection', () => {
+    it('does not replay inherited provider history and retains its existing user history points', async () => {
+        const send = vi.fn(); const user = vi.fn();
+        const session = { getMetadata: () => ({ codexProviderHistory: { previousThreadIds: ['old'], inheritedTurnIds: ['old-turn'] },
+            conversationHistoryTurns: { 'old-user': 'old-turn' } }), sendAgentMessage: send, sendUserMessage: user } as unknown as ApiSessionClient;
+        const projection = new SharedCodexProjection(session, 'new', async () => {});
+        await projection.history({ turns: [
+            { id: 'old-turn', status: 'completed', items: [{ id: 'old-item', type: 'agentMessage', text: 'already saved' }] },
+            { id: 'new-turn', status: 'completed', items: [{ id: 'new-item', type: 'agentMessage', text: 'new output' }] }
+        ] });
+        expect(send).toHaveBeenCalledTimes(1);
+        expect(send.mock.calls[0][0]).toMatchObject({ message: 'new output' });
+        expect(projection.turnFor('old-user')).toBe('old-turn');
+    });
+    it('keeps origin IDs for inherited live notifications across repeated forks and reconnects', async () => {
+        const messages = new Map<string, unknown>();
+        const send = vi.fn((body: unknown, id: string) => { if (!messages.has(id)) messages.set(id, body); });
+        const metadata = { codexProviderHistory: { previousThreadIds: ['original'], inheritedTurnIds: ['old-turn'], turnOrigins: { 'old-turn': 'original' } } };
+        const session = { getMetadata: () => metadata, sendAgentMessage: send } as unknown as ApiSessionClient;
+        const event = { turnId: 'old-turn', item: { id: 'old-item', type: 'agentMessage', text: 'retained' } };
+        const original = new SharedCodexProjection(session, 'original', async () => {});
+        await original.notification('item/completed', { ...event, threadId: 'original' });
+        for (const threadId of ['fork-1', 'fork-2']) {
+            const fork = new SharedCodexProjection(session, threadId, async () => {});
+            await fork.notification('item/completed', { ...event, threadId });
+            fork.reset();
+            await fork.notification('item/completed', { ...event, threadId });
+            await fork.notification('item/completed', { threadId, turnId: 'new-' + threadId,
+                item: { id: 'new', type: 'agentMessage', text: 'new output' } });
+        }
+        expect(messages.size).toBe(3);
+        expect(send.mock.calls.filter(([, id]) => id.includes('old-turn')).map(([, id]) => id))
+            .toEqual(Array(5).fill('codex:original:old-turn:old-item:agent_message'));
+    });
     it('displays async answers as readable user messages while preserving native IDs', async () => {
         const sendUserMessage = vi.fn(); const committed = vi.fn(async () => {});
         const observe = vi.fn();

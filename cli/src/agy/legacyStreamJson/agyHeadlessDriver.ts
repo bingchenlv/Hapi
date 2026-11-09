@@ -18,6 +18,7 @@ import { AgyStreamProcess } from './agyStreamProcess';
 import { sendAgyTranscriptEntry } from './agyTranscript';
 import { AGY_EFFORT_LEVELS, AGY_MODEL_LABELS, splitAgyModelSelection, type AgyEffortLevel } from '@hapi/protocol';
 import { getAgentLaunchCommand } from '@/agent/agentLaunchCommand';
+import { withSessionProjectContext } from '@/codex/shared/project';
 
 const AGY_PRINT_TIMEOUT = '30m';
 
@@ -688,7 +689,7 @@ export class AgyHeadlessDriver extends RemoteLauncherBase {
         try {
             if (stream.closed) finalize(stream.closeCode);
             else if (signal.aborted || stream.retiring) await stream.retire();
-            else stream.writePrompt(prompt);
+            else stream.writePrompt(withSessionProjectContext(prompt, this.session.client.getMetadata()?.project) ?? prompt);
             await completed;
         } finally {
             if (stream.onLine === handleLine) stream.onLine = null;

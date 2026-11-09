@@ -164,6 +164,13 @@ export class SharedCodexQueue {
         }
     }
 
+    /** Only restore entries whose native deletion was positively acknowledged. */
+    async resumeReleased(): Promise<void> {
+        for (const [id, entry] of Object.entries(this.entries)) {
+            if (entry.state === 'released') await this.enqueue(id, entry.input);
+        }
+    }
+
     enqueue(id: string, input: QueueInput, resumeInterrupted = false): Promise<void> {
         return this.serial(async () => {
             const existing = this.entries[id];

@@ -38,6 +38,7 @@ import { cleanupRunnerState, getInstalledCliMtimeMs, isRunnerRunningCurrentlyIns
 import { startRunnerControlServer } from './controlServer';
 import { createWorktree, removeWorktree, type WorktreeInfo } from './worktree';
 import { validateWorkspaceDirectory } from './validateWorkspaceDirectory';
+import { classifySpawnFailure, waitForStderrDrain, RESOURCE_GUARD_EXIT_CODE, type SpawnFailureKind } from './resourceGuard';
 import { join } from 'path';
 import { buildMachineMetadata } from '@/agent/sessionFactory';
 import { resolveWorkspaceRoots } from '@/utils/workspaceRoot';
@@ -153,6 +154,182 @@ export function releaseRecoveredSpawnDedupe(
   if (!existingSessionId) return;
   spawnSession.onChildExited(existingSessionId);
   existingSessionIdByChildPid.delete(pid);
+}
+
+/** Durable identity record for one runner child. Only written when a process
+ * start marker was available at spawn time, so the live pid aliases have to be
+ * used as a fallback source of truth. */
+export type ResumeProcessRecord = { requestedSessionId: string; confirmedSessionId?: string };
+
+/** A shared wrapper may outlive its original root. Retire that root's spawn
+ * acknowledgement only; the wrapper and its sibling roots remain running. */
+export function releaseArchivedSharedResume(options: {
+  pid: number;
+  sessionId: string;
+  tracked?: Pick<TrackedSession, 'happySessionId' | 'requestedHappySessionId' | 'primaryAckRetired'>;
+  childOwners: Map<number, string>;
+  persisted: Map<number, ResumeProcessRecord>;
+  requested: Map<number, string>;
+  confirmed: Map<number, string>;
+  spawn: SpawnDeduplicator;
+}): boolean {
+  const { pid, sessionId, tracked, childOwners, persisted, requested, confirmed, spawn } = options;
+  const record = persisted.get(pid);
+  const owner = childOwners.get(pid);
+  // The durable record only exists when a process start marker was available at
+  // spawn time, so the live pid aliases are the fallback source of truth.
+  const requestedId = record?.requestedSessionId ?? requested.get(pid);
+  const confirmedId = record?.confirmedSessionId ?? confirmed.get(pid);
+  // The confirmed alias is not owned by the requested side of the map: a
+  // sibling root can report itself before the primary does. Only a durable
+  // record or the tracked primary identity proves that the archived root is
+  // this child's own row, so an unproven confirmed match is ignored.
+  const matchesRequestedSide = sessionId === owner || sessionId === requestedId;
+  const matchesConfirmedSide = sessionId === confirmedId;
+  const confirmedProvesOwnership = record?.confirmedSessionId === sessionId
+    || tracked?.happySessionId === sessionId;
+  if (!matchesRequestedSide && !(matchesConfirmedSide && confirmedProvesOwnership)) return false;
+  // The dedupe key is always the requested side (options.existingSessionId).
+  // Releasing a confirmed id could drop a different, live child's ack.
+  const dedupeKey = owner ?? requestedId;
+  if (dedupeKey) spawn.onChildExited(dedupeKey);
+  if (requestedId && requestedId !== dedupeKey) spawn.onChildExited(requestedId);
+  childOwners.delete(pid);
+  persisted.delete(pid);
+  requested.delete(pid);
+  confirmed.delete(pid);
+  const aliases = new Set([sessionId, owner, requestedId, confirmedId]);
+  if (tracked) {
+    // The acknowledgement is gone for good: a later sibling webhook must not
+    // reclaim this process ACK. Record that explicitly instead of inferring it
+    // from the now-empty identity fields.
+    tracked.primaryAckRetired = true;
+    if (aliases.has(tracked.happySessionId)) tracked.happySessionId = undefined;
+    if (aliases.has(tracked.requestedHappySessionId)) tracked.requestedHappySessionId = undefined;
+  }
+  return true;
+}
+
+/** Consume an archived-root webhook for one runner child.
+ *
+ * `consumed` is true when the PID is a known runner child: the generic orphan
+ * handling must not turn an archived root into a live session again.
+ * `released` is true when the archived root's spawn acknowledgement was
+ * retired, so the same HAPI row can spawn a fresh generation. */
+export function handleArchivedSharedWebhook(options: {
+  pid: number;
+  sessionId: string;
+  tracked?: Pick<TrackedSession, 'happySessionId' | 'requestedHappySessionId' | 'primaryAckRetired'>;
+  childOwners: Map<number, string>;
+  persisted: Map<number, ResumeProcessRecord>;
+  requested: Map<number, string>;
+  confirmed: Map<number, string>;
+  spawn: SpawnDeduplicator;
+}): { consumed: boolean; released: boolean } {
+  const knownRunnerChild = options.childOwners.has(options.pid)
+    || options.requested.has(options.pid)
+    || options.confirmed.has(options.pid)
+    || options.persisted.has(options.pid);
+  const released = releaseArchivedSharedResume(options);
+  return { consumed: knownRunnerChild, released };
+}
+
+/** Roots that reported `archived` must never be re-promoted by a late webhook:
+ * re-promotion would restore the tracked identity of that root and let a later
+ * stopSession(archivedRow) tear down the shared wrapper and its sibling roots. */
+export function createArchivedRootRegistry() {
+  // lifecycleStateSince identifies a root activation, unlike PID (the wrapper
+  // can host a later explicit resume of the same row). Archive wins ties.
+  const rootsByPid = new Map<number, Map<string, { generation?: number; archived: boolean }>>();
+  const observe = (pid: number, id: string, generation: number | undefined, archived: boolean): boolean => {
+    const roots = rootsByPid.get(pid) ?? new Map();
+    const previous = roots.get(id);
+    const next = Number.isFinite(generation) ? generation : undefined;
+    if (previous) {
+      if (previous.generation !== undefined && (next === undefined || next < previous.generation)) return false;
+      const newer = next !== undefined && (previous.generation === undefined || next > previous.generation);
+      if (!archived && previous.archived && !newer) return false;
+    }
+    roots.set(id, { generation: next, archived }); rootsByPid.set(pid, roots);
+    return true;
+  };
+  return {
+    mark: (pid: number, id: string, generation?: number) => observe(pid, id, generation, true),
+    activate: (pid: number, id: string, generation?: number) => observe(pid, id, generation, false),
+    isArchived: (pid: number, id: string) => rootsByPid.get(pid)?.get(id)?.archived === true,
+    forget: (pid: number) => { rootsByPid.delete(pid); },
+  };
+}
+
+export type SharedRootWebhookAction = 'archive' | 'ignore-late' | 'ignore-secondary' | 'promote';
+
+/** Decide what a shared-root webhook means for the tracked wrapper. */
+export function decideSharedRootAction(options: {
+  sessionId: string;
+  lifecycleState?: string;
+  archivedRoot: boolean;
+  primaryId?: string;
+}): SharedRootWebhookAction {
+  if (options.lifecycleState === 'archived') return 'archive';
+  if (options.archivedRoot) return 'ignore-late';
+  if (options.primaryId && options.primaryId !== options.sessionId) return 'ignore-secondary';
+  return 'promote';
+}
+
+/** Shared-root lifecycle handling used by the actual Runner webhook. Returning
+ * true prevents generic process-level confirmation/adoption of that root. */
+export function applySharedRootWebhook(options: Parameters<typeof handleArchivedSharedWebhook>[0] & {
+  metadata: Pick<Metadata, 'lifecycleState' | 'lifecycleStateSince' | 'capabilities'>;
+  tracked?: TrackedSession;
+  archivedRoots: ReturnType<typeof createArchivedRootRegistry>;
+  persist: () => void;
+  invalidate: (id: string) => void;
+}): boolean {
+  const { pid, sessionId, metadata, tracked, archivedRoots } = options;
+  if (!metadata.capabilities?.concurrentClients) return false;
+  if (metadata.lifecycleState === 'archived') {
+    if (!archivedRoots.mark(pid, sessionId, metadata.lifecycleStateSince)) return true;
+    if (tracked?.sharedSessions) delete tracked.sharedSessions[sessionId];
+    if (handleArchivedSharedWebhook(options).released) options.persist();
+    // Includes unknown/external PIDs: archived is never an online registration.
+    return true;
+  }
+  if (!archivedRoots.activate(pid, sessionId, metadata.lifecycleStateSince)) return true;
+  if (!tracked) return false; // Existing unknown-shared handling stays in charge.
+  tracked.sharedSessions ??= {};
+  tracked.sharedSessions[sessionId] = metadata as Metadata;
+  options.invalidate(sessionId);
+  // After retiring the primary, sibling metadata cannot reclaim the process
+  // ACK. A child that never received an acknowledgement (a first-time creation
+  // has no preallocated identity) must still confirm its first webhook, so the
+  // retirement is tracked explicitly instead of inferred from empty identity
+  // fields.
+  if (tracked.startedBy === 'runner' && tracked.primaryAckRetired) return true;
+  return decideSharedRootAction({ sessionId, archivedRoot: false, primaryId: tracked.happySessionId }) === 'ignore-secondary';
+}
+
+/** Hub can observe archive before the delayed close webhook reaches Runner.
+ * Only a verified, unambiguous local runtime's explicit inactive binding may
+ * retire a cached ACK on a new user resume. Missing/uncertain records do not. */
+export function reconcileArchivedSharedResume(options: {
+  sessionId: string;
+  owners: ReadonlyMap<number, string>;
+  records: ReadonlyArray<{ pid: number; marker: string; hub: string; authHash: string;
+    pendingCreations?: string[]; sessions: Record<string, { active: boolean }> }>;
+  hub: string;
+  authHash: string;
+  isLive: (pid: number, marker: string) => boolean;
+  archive: (pid: number, sessionId: string) => void;
+}): boolean {
+  const owners = [...options.owners].filter(([, id]) => id === options.sessionId);
+  if (owners.length !== 1) return false;
+  const [pid] = owners[0];
+  const runtime = options.records.find(record => record.pid === pid && record.hub === options.hub
+    && record.authHash === options.authHash && !record.pendingCreations?.length
+    && options.isLive(pid, record.marker));
+  if (runtime?.sessions[options.sessionId]?.active !== false) return false;
+  options.archive(pid, options.sessionId);
+  return true;
 }
 
 export async function startRunner(options: { workspaceRoots?: string[] } = {}): Promise<void> {
@@ -311,6 +488,8 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
     // tracking, so confirmed exit can be attributed to the requested HAPI row.
     const pidToRequestedSessionId = new Map<number, string>();
     const pidToConfirmedSessionId = new Map<number, string>();
+    // Archived roots stay archived: a late webhook must not resurrect them.
+    const archivedRoots = createArchivedRootRegistry();
     // Generation-local: PIDs whose TrackedSession was dropped by webhook timeout.
     // Late runner webhooks may kill only these — never recovered shared roots
     // that merely appear in resume-processes after a runner restart (#1911).
@@ -473,18 +652,14 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
       // Check if we already have this PID (runner-spawned)
       const existingSession = pidToTrackedSession.get(pid);
 
+      if (applySharedRootWebhook({ pid, sessionId, metadata: sessionMetadata, tracked: existingSession,
+        archivedRoots, childOwners: existingSessionIdByChildPid, persisted: persistedResumeProcesses,
+        requested: pidToRequestedSessionId, confirmed: pidToConfirmedSessionId, spawn: spawnSession,
+        persist: persistResumeProcesses, invalidate: invalidateVerifiedExit })) return;
       if (existingSession && sessionMetadata.capabilities?.concurrentClients) {
-        existingSession.sharedSessions ??= {};
-        if (sessionMetadata.lifecycleState === 'archived') {
-          delete existingSession.sharedSessions[sessionId];
-          return;
-        }
-        existingSession.sharedSessions[sessionId] = sessionMetadata;
-        invalidateVerifiedExit(sessionId);
         // Native /new or /fork cannot replace the primary spawn confirmation.
         if (pidToAwaiter.has(pid) && existingSession.requestedHappySessionId
           && existingSession.requestedHappySessionId !== sessionId) return;
-        if (existingSession.happySessionId && existingSession.happySessionId !== sessionId) return;
       }
 
       if (existingSession && existingSession.startedBy === 'runner') {
@@ -626,6 +801,8 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
     let spawnSession!: SpawnDeduplicator;
     const spawnSessionOnce = async (options: SpawnSessionOptions): Promise<SpawnSessionResult> => {
       logger.debugLargeJson('[RUNNER RUN] Spawning session', options);
+      const requestId = typeof options.requestId === 'string' && /^[a-f0-9-]{36}$/i.test(options.requestId) ? options.requestId : undefined;
+      if (requestId) logger.debug(`[RUNNER RUN] spawn request_id=${requestId}`);
 
       const { directory, sessionId, machineId, approvedNewDirectoryCreation = true } = options;
       const agent = options.agent ?? 'claude';
@@ -826,6 +1003,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           };
         }
 
+        if ((agent === 'codex' || agent === 'agy') && options.sessionProject) extraEnv.HAPI_SESSION_PROJECT = JSON.stringify(options.sessionProject);
         const args = buildCliArgs(agent, options, yolo);
 
         // sessionId reserved for future use
@@ -853,6 +1031,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           stdio: ['ignore', 'pipe', 'pipe'],  // Capture stdout/stderr for debugging
           env: {
             ...process.env,
+            HAPI_SESSION_PROJECT: undefined,
             ...extraEnv
           }
         });
@@ -911,11 +1090,12 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
         const webhookTimeoutMs = sessionStartupTimeout(options.agent, process.env.HAPI_RUNNER_WEBHOOK_TIMEOUT_MS);
         let observedExitCode: number | null = null;
         let observedExitSignal: NodeJS.Signals | null = null;
+        let observedFailureKind: SpawnFailureKind | null = null;
         const buildWebhookFailureMessage = (reason: 'timeout' | 'exit-before-webhook' | 'process-error-before-webhook'): string => {
-          let message = '';
-          if (reason === 'exit-before-webhook') {
-            message = `Session process exited before webhook for PID ${pid}`;
-          } else if (reason === 'process-error-before-webhook') {
+            let message = '';
+            if (reason === 'exit-before-webhook') {
+                message = `Session process exited before webhook for PID ${pid}`;
+            } else if (reason === 'process-error-before-webhook') {
             message = `Session process error before webhook for PID ${pid}`;
           } else {
             message = `Session webhook timeout for PID ${pid} after ${webhookTimeoutMs}ms`;
@@ -934,6 +1114,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           }
 
           const trimmedTail = stderrTail.trim();
+          if (requestId) message += ` [request_id=${requestId}]`;
           if (trimmedTail) {
             const compactTail = trimmedTail.replace(/\s+/g, ' ');
             const tailForMessage = compactTail.length > 800 ? compactTail.slice(-800) : compactTail;
@@ -967,9 +1148,19 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           }
         }
 
+        // The webhook timeout and the exit handler resolve the same promise.
+        // The handle lives in this scope so the exit handler can disarm it:
+        // once the child is gone no webhook can arrive any more, and the
+        // webhook timeout must not preempt the bounded stderr drain below.
+        let webhookTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
+
         happyProcess.on('exit', (code, signal) => {
           observedExitCode = typeof code === 'number' ? code : null;
           observedExitSignal = signal ?? null;
+          if (webhookTimeoutHandle) {
+            clearTimeout(webhookTimeoutHandle);
+            webhookTimeoutHandle = undefined;
+          }
           logger.debug(`[RUNNER RUN] Child PID ${pid} exited with code ${code}, signal ${signal}`);
           if (code !== 0 || signal) {
             logStderrTail();
@@ -978,7 +1169,29 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           if (errorAwaiter) {
             pidToErrorAwaiter.delete(pid);
             pidToAwaiter.delete(pid);
-            errorAwaiter(buildWebhookFailureMessage('exit-before-webhook'));
+            // A resource-guard rejection is reported by the child as exit code
+            // 75 plus a `[HAPI resource guard]` marker on stderr. Classify it
+            // here so the hub can answer 503 instead of a generic 500. Every
+            // other exit - including a bare exit 75 without the marker - and
+            // the webhook timeout stay plain spawn errors.
+            const settleExitFailure = () => {
+              observedFailureKind = classifySpawnFailure({
+                exitCode: observedExitCode,
+                signal: observedExitSignal,
+                stderr: stderrTail,
+                timedOut: false
+              });
+              errorAwaiter(buildWebhookFailureMessage('exit-before-webhook'));
+            };
+            if (observedExitCode === RESOURCE_GUARD_EXIT_CODE && happyProcess) {
+              // The guard writes its marker and exits immediately, so the
+              // marker can still be in flight when 'exit' is delivered. Drain
+              // stderr (bounded) before classifying; every other exit keeps
+              // the current fail-fast behaviour.
+              waitForStderrDrain(happyProcess, settleExitFailure);
+            } else {
+              settleExitFailure();
+            }
           }
           onChildExited(pid);
         });
@@ -1034,6 +1247,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           // HAPI_RUNNER_WEBHOOK_TIMEOUT_MS for users on slow models
           // (e.g. opus[1m] --resume).
           const timeout = setTimeout(() => {
+            webhookTimeoutHandle = undefined;
             void (async () => {
               pidToAwaiter.delete(pid);
               pidToErrorAwaiter.delete(pid);
@@ -1098,10 +1312,14 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
               });
             })();
           }, webhookTimeoutMs);
+          // Publish the handle so the exit handler can disarm the webhook
+          // timeout before the bounded stderr drain starts.
+          webhookTimeoutHandle = timeout;
 
           // Register awaiter
           pidToAwaiter.set(pid, (completedSession) => {
             clearTimeout(timeout);
+            webhookTimeoutHandle = undefined;
             pidToErrorAwaiter.delete(pid);
             logger.debug(`[RUNNER RUN] Session ${completedSession.happySessionId} fully spawned with webhook`);
             resolve({
@@ -1111,9 +1329,11 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           });
           pidToErrorAwaiter.set(pid, (errorMessage) => {
             clearTimeout(timeout);
+            webhookTimeoutHandle = undefined;
             resolve({
               type: 'error',
-              errorMessage
+              errorMessage,
+              ...(observedFailureKind === 'resource_busy' ? { code: 'resource_busy' as const } : {})
             });
           });
         });
@@ -1150,7 +1370,26 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
       }
     };
 
-    spawnSession = createSpawnDeduplicator(spawnSessionOnce);
+    const deduplicatedSpawn = createSpawnDeduplicator(spawnSessionOnce);
+    spawnSession = Object.assign(async (options: SpawnSessionOptions) => {
+      const sessionId = options.existingSessionId;
+      if (sessionId && [...existingSessionIdByChildPid.values()].includes(sessionId)) {
+        reconcileArchivedSharedResume({ sessionId, owners: existingSessionIdByChildPid, records: await readRuntimes(),
+          hub: configuration.apiUrl, authHash: runtimeAuthHash(),
+          isLive: (pid, marker) => isProcessAlive(pid) && getProcessStartMarker(pid) === marker,
+          archive: (pid, id) => {
+            const tracked = pidToTrackedSession.get(pid);
+            const metadata = tracked?.sharedSessions?.[id] ?? tracked?.happySessionMetadataFromLocalWebhook;
+            applySharedRootWebhook({ pid, sessionId: id, tracked,
+              metadata: { capabilities: { concurrentClients: true }, lifecycleState: 'archived',
+                lifecycleStateSince: metadata?.lifecycleStateSince ?? Date.now() },
+              archivedRoots, childOwners: existingSessionIdByChildPid, persisted: persistedResumeProcesses,
+              requested: pidToRequestedSessionId, confirmed: pidToConfirmedSessionId, spawn: deduplicatedSpawn,
+              persist: persistResumeProcesses, invalidate: invalidateVerifiedExit });
+          } });
+      }
+      return deduplicatedSpawn(options);
+    }, deduplicatedSpawn);
     for (const [pid, record] of persistedResumeProcesses) {
       const verified = pidToRequestedSessionId.get(pid) === record.requestedSessionId;
       existingSessionIdByChildPid.set(pid, record.requestedSessionId);
@@ -1491,6 +1730,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           pidToTrackedSession.delete(pid);
           pidToRequestedSessionId.delete(pid);
           pidToConfirmedSessionId.delete(pid);
+          archivedRoots.forget(pid);
           if (persistedResumeProcesses.delete(pid)) persistResumeProcesses();
           logger.debug(`[RUNNER RUN] Removed terminated session ${sessionId} from tracking`);
           return await finishWithOrphanSweep('stopped');
@@ -1645,6 +1885,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
       pidToErrorAwaiter.delete(pid);
       pidToRequestedSessionId.delete(pid);
       pidToConfirmedSessionId.delete(pid);
+      archivedRoots.forget(pid);
       webhookTimeoutOrphanPids.delete(pid);
       if (persistedResumeProcesses.delete(pid)) persistResumeProcesses();
     };

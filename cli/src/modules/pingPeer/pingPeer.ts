@@ -9,8 +9,10 @@
  * Callers must not invent parallel auth or arbitrary hosts.
  */
 
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import axios, { type AxiosInstance } from 'axios'
+import { MaintenanceMessageRequestSchema, MaintenanceMessageReceiptSchema, maintenanceMessageDigestInput,
+    type MaintenanceMessageRequest, type MaintenanceMessageReceipt } from '@hapi/protocol/apiTypes'
 import {
     extractAssistantPlainText,
     getPermissionModesForFlavor,
@@ -138,6 +140,126 @@ export const PEER_MESSAGE_LOCAL_ID_PREFIX = 'ping-peer-'
 
 export function createPeerMessageLocalId(): string {
     return `${PEER_MESSAGE_LOCAL_ID_PREFIX}${randomUUID()}`
+}
+
+type MaintenanceTransportOptions = {
+    sessionId: string
+    apiUrl?: string
+    accessToken?: string
+    http?: AxiosInstance
+}
+
+/** Exactly one versioned submit, no resume and no automatic transport replay.
+ * Caller must persist its intent and recheck task/control/quota before calling.
+ * This transport receipt is never proof of model execution or completion.
+ */
+export async function submitMaintenanceMessage(options: MaintenanceTransportOptions & {
+    request: MaintenanceMessageRequest
+}): Promise<MaintenanceMessageReceipt> {
+    const parsed = MaintenanceMessageRequestSchema.safeParse(options.request)
+    if (!parsed.success || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(options.sessionId)) {
+        throw new PingPeerError('bad_args', 'Exact maintenance binding and versioned request required')
+    }
+    const digest = createHash('sha256').update(maintenanceMessageDigestInput(options.sessionId, parsed.data)).digest('hex')
+    if (digest !== parsed.data.contentSha256) throw new PingPeerError('bad_args', 'Maintenance request content digest mismatch')
+    try {
+        const apiUrl = resolveApiUrl(options.apiUrl)
+        const http = options.http ?? axios.create({ maxRedirects: 0, maxContentLength: 65_536 })
+        const jwt = await exchangeJwt(apiUrl, resolveAccessToken(options.accessToken), http)
+        const session = await getSession(apiUrl, jwt, options.sessionId, http)
+        if (session.id !== options.sessionId || session.active !== true || session.metadata?.flavor !== 'codex') throw new Error('binding')
+        const response = await http.post(`${apiUrl}/api/sessions/${encodeURIComponent(options.sessionId)}/maintenance/messages`,
+            parsed.data, { headers: authHeaders(jwt), timeout: 30_000, validateStatus: () => true })
+        const receipt = MaintenanceMessageReceiptSchema.safeParse(response.data)
+        if (response.status !== 200 || !receipt.success || receipt.data.sessionId !== options.sessionId
+            || receipt.data.requestKey !== parsed.data.requestKey || receipt.data.contentSha256 !== digest) throw new Error('receipt')
+        return receipt.data
+    } catch {
+        throw new PingPeerError('send_failed', 'Maintenance submission unconfirmed; reconcile original request without replay')
+    }
+}
+
+/** Exact-key lookup; 404/absence is unknown and never proof of non-delivery. */
+export async function readMaintenanceReceipt(options: MaintenanceTransportOptions & { requestKey: string }): Promise<MaintenanceMessageReceipt | null> {
+    if (!MaintenanceMessageRequestSchema.shape.requestKey.safeParse(options.requestKey).success
+        || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(options.sessionId)) {
+        throw new PingPeerError('bad_args', 'Exact maintenance binding and request key required')
+    }
+    try {
+        const apiUrl = resolveApiUrl(options.apiUrl)
+        const http = options.http ?? axios.create({ maxRedirects: 0, maxContentLength: 65_536 })
+        const jwt = await exchangeJwt(apiUrl, resolveAccessToken(options.accessToken), http)
+        const response = await http.get(`${apiUrl}/api/sessions/${encodeURIComponent(options.sessionId)}/maintenance/requests/${encodeURIComponent(options.requestKey)}`,
+            { headers: authHeaders(jwt), timeout: 10_000, validateStatus: () => true })
+        if (response.status === 404) return null
+        const receipt = MaintenanceMessageReceiptSchema.safeParse(response.data)
+        if (response.status !== 200 || !receipt.success || receipt.data.sessionId !== options.sessionId
+            || receipt.data.requestKey !== options.requestKey) throw new Error('receipt')
+        return receipt.data
+    } catch {
+        throw new PingPeerError('not_found', 'Maintenance observation unavailable; delivery remains unknown')
+    }
+}
+
+export type QueuedStateObservation = {
+    queuedLocalIds: string[]
+    indeterminateLocalIds: string[]
+    invokedLocalMessages: Array<{ localId: string; invokedAt: number }>
+}
+
+/** Read one exact session/key through the native Hub authentication flow.
+ * Does not resume, deliver, retry, or claim that invocation means completion.
+ */
+export async function inspectQueuedState(options: {
+    sessionId: string
+    requestKey: string
+    apiUrl?: string
+    accessToken?: string
+    http?: AxiosInstance
+}): Promise<QueuedStateObservation> {
+    if (typeof options.sessionId !== 'string'
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(options.sessionId)
+        || typeof options.requestKey !== 'string' || !options.requestKey.trim()
+        || Buffer.byteLength(options.requestKey, 'utf8') > 256
+        || Buffer.from(options.requestKey, 'utf8').toString('utf8') !== options.requestKey) {
+        throw new PingPeerError('bad_args', 'Exact session identity and bounded request key required')
+    }
+    try {
+        const apiUrl = resolveApiUrl(options.apiUrl)
+        const http = options.http ?? axios.create({ maxRedirects: 0, maxContentLength: 65_536 })
+        const jwt = await exchangeJwt(apiUrl, resolveAccessToken(options.accessToken), http)
+        const before = await getSession(apiUrl, jwt, options.sessionId, http)
+        if (before.id !== options.sessionId || before.metadata?.flavor !== 'codex'
+            || typeof before.active !== 'boolean') throw new Error('binding')
+        const response = await http.post(
+            `${apiUrl}/api/sessions/${encodeURIComponent(options.sessionId)}/messages/queued-state`,
+            { localIds: [options.requestKey] },
+            { headers: authHeaders(jwt), timeout: 10_000, validateStatus: () => true }
+        )
+        const body: unknown = response.data
+        if (response.status !== 200 || !isObject(body)
+            || Object.keys(body).sort().join(',') !== 'indeterminateLocalIds,invokedLocalMessages,queuedLocalIds') {
+            throw new Error('response')
+        }
+        const { queuedLocalIds, indeterminateLocalIds, invokedLocalMessages } = body
+        if (!Array.isArray(queuedLocalIds) || !Array.isArray(indeterminateLocalIds) || !Array.isArray(invokedLocalMessages)
+            || queuedLocalIds.length + indeterminateLocalIds.length + invokedLocalMessages.length > 1
+            || [...queuedLocalIds, ...indeterminateLocalIds].some(id => id !== options.requestKey)
+            || invokedLocalMessages.some(item => !isObject(item)
+                || Object.keys(item).sort().join(',') !== 'invokedAt,localId'
+                || item.localId !== options.requestKey || typeof item.invokedAt !== 'number'
+                || !Number.isFinite(item.invokedAt) || item.invokedAt <= 0)) {
+            throw new Error('response')
+        }
+        const after = await getSession(apiUrl, jwt, options.sessionId, http)
+        if (after.id !== before.id || after.metadata?.flavor !== 'codex' || after.active !== before.active) {
+            throw new Error('binding changed')
+        }
+        return { queuedLocalIds, indeterminateLocalIds, invokedLocalMessages } as QueuedStateObservation
+    } catch {
+        // Network errors and response bodies can contain tokens or request text.
+        throw new PingPeerError('not_found', 'Queued-state observation unavailable; delivery remains unknown')
+    }
 }
 
 export type ListPeerSessionsOptions = {

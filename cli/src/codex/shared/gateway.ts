@@ -29,10 +29,11 @@ export type GatewayHooks = {
 /** Byte-preserving for normal traffic; only lifecycle requests have a binding barrier. */
 export async function startCodexGateway(options: {
     upstream: string; upstreamToken?: string; path?: string; token: string; hooks: GatewayHooks;
-}): Promise<{ endpoint: string; close(): Promise<void> }> {
+}): Promise<{ endpoint: string; drain(threadId: string): Promise<void>; close(): Promise<void> }> {
     const server = createServer((_request, response) => { response.writeHead(404).end(); });
     const websocket = new WebSocketServer({ noServer: true, maxPayload: CODEX_WEBSOCKET_MAX_PAYLOAD });
     const connections = new Map<WebSocket, WebSocket>();
+    const drains = new Map<WebSocket, (threadId: string) => Promise<void>>();
     server.on('upgrade', (request, socket, head) => {
         if (!options.path) {
             const provided = Buffer.from(request.headers.authorization ?? '');
@@ -52,6 +53,8 @@ export async function startCodexGateway(options: {
         });
         connections.set(downstream, upstream);
         const pending = new Map<string | number, Envelope>();
+        const forwarded = new Map<string | number, Envelope>();
+        const changed = new Set<() => void>();
         const ready = new Promise<void>((resolve, reject) => { upstream.once('open', resolve); upstream.once('error', reject); });
         void ready.catch(() => downstream.close(1011, 'Codex unavailable'));
         let detached = false;
@@ -63,13 +66,25 @@ export async function startCodexGateway(options: {
         const finish = () => {
             if (finished) return;
             finished = true; clearTimeout(drainTimer);
-            connections.delete(downstream); upstream.close();
+            connections.delete(downstream); drains.delete(downstream); upstream.close();
+            forwarded.clear(); for (const notify of changed) notify();
             options.hooks.disconnected?.(connectionId);
         };
         const drained = () => { if (detached && processing === 0 && pending.size === 0) finish(); };
         const send = (target: WebSocket, value: Envelope) => {
             if (target.readyState === WebSocket.OPEN) target.send(JSON.stringify(value));
         };
+        drains.set(downstream, async threadId => {
+            await incoming;
+            await new Promise<void>((resolve, reject) => {
+                const timer = setTimeout(() => { changed.delete(check); reject(new Error('A frontend operation is unconfirmed; provider switch deferred')); }, 10_000);
+                const check = () => {
+                    if ([...forwarded.values()].some(value => record(value.params).threadId === threadId)) return;
+                    clearTimeout(timer); changed.delete(check); resolve();
+                };
+                changed.add(check); check();
+            });
+        });
         downstream.on('message', raw => {
             let message: Envelope;
             try { message = EnvelopeSchema.parse(JSON.parse(raw.toString())); }
@@ -85,6 +100,7 @@ export async function startCodexGateway(options: {
                         return;
                     }
                     const transformed = await options.hooks.before(message, connectionId);
+                    if (transformed.id !== undefined) forwarded.set(transformed.id, transformed);
                     if (transformed.id !== undefined && ['thread/start', 'thread/resume', 'thread/fork', 'thread/archive', 'thread/revert', 'thread/rollback', 'thread/queue/delete'].includes(transformed.method ?? '')) {
                         pending.set(transformed.id, transformed);
                     }
@@ -97,6 +113,9 @@ export async function startCodexGateway(options: {
         upstream.on('message', raw => {
             outgoing = outgoing.then(async () => {
                 const message = EnvelopeSchema.parse(JSON.parse(raw.toString()));
+                if (!message.method && message.id !== undefined) {
+                    forwarded.delete(message.id); for (const notify of changed) notify();
+                }
                 const request = message.method === undefined && message.id !== undefined ? pending.get(message.id) : undefined;
                 let replay: void | Envelope[] = undefined;
                 if (request) {
@@ -132,7 +151,7 @@ export async function startCodexGateway(options: {
     if (options.path) await chmod(options.path, 0o600);
     const address = server.address();
     const endpoint = options.path ? `unix://${options.path}` : `ws://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
-    return { endpoint, async close() {
+    return { endpoint, async drain(threadId) { await Promise.all([...drains.values()].map(drain => drain(threadId))); }, async close() {
         for (const [client, upstream] of connections) { client.terminate(); upstream.terminate(); }
         websocket.close();
         await new Promise<void>(resolve => server.close(() => resolve()));

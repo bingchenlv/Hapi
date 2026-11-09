@@ -15,6 +15,10 @@ export interface TrackedSession {
   happySessionId?: string;
   /** HAPI row requested for this process generation before its webhook arrives. */
   requestedHappySessionId?: string;
+  /** Set only when this child's primary spawn acknowledgement was explicitly
+   * retired (its root archived). A child that never received an acknowledgement
+   * must still be able to confirm its first webhook. */
+  primaryAckRetired?: boolean;
   happySessionMetadataFromLocalWebhook?: Metadata;
   pid: number;
   childProcess?: ChildProcess;

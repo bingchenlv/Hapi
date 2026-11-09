@@ -7,6 +7,8 @@ import { CodexAppServerClient } from '@/codex/codexAppServerClient';
 import { resolveModelCatalogArgs } from '@/codex/utils/modelCatalog';
 import { resolveCodexHome } from '@/codex/utils/codexHome';
 import { getErrorMessage } from './rpcResponses';
+import { withMiniMaxModel } from '@/codex/shared/minimax';
+import { withDeepSeekModels } from '@/codex/shared/deepseek';
 
 export interface ListCodexModelsRequest {
     includeHidden?: boolean;
@@ -143,6 +145,13 @@ export async function listCodexModels(includeHidden: boolean = false): Promise<C
     }
 
     const promise = fetchCodexModelsFromAppServer(includeHidden)
+        .catch(error => {
+            const standalone = withDeepSeekModels(withMiniMaxModel([]));
+            if (standalone.length) return standalone;
+            throw error;
+        })
+        .then(withMiniMaxModel)
+        .then(withDeepSeekModels)
         .then((models) => {
             if (models.length > 0 && inflight.get(includeHidden)?.promise === promise) {
                 cache.set(includeHidden, {

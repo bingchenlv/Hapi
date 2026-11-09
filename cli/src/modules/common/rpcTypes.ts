@@ -1,9 +1,12 @@
-import type { AgentFlavor } from '@hapi/protocol'
+import type { AgentFlavor, SessionProject } from '@hapi/protocol'
 import type { CopilotAgentMode } from '@hapi/protocol'
 
 export interface SpawnSessionOptions {
+    /** Correlation only; never a session identity or deduplication key. */
+    requestId?: string
     machineId?: string
     directory: string
+    sessionProject?: SessionProject
     sessionId?: string
     // Live hub row id for reopen/resume. Runner stamps `--existing-session-id`.
     existingSessionId?: string
@@ -37,7 +40,7 @@ export type SpawnSessionResult =
     | {
         type: 'error'
         errorMessage: string
-        code?: 'agent_unavailable' | 'outside_workspace_roots'
+        code?: 'agent_unavailable' | 'outside_workspace_roots' | 'resource_busy'
         agent?: AgentFlavor
         /**
          * Explicit false = runner rejected before exec (no OS child). Hub may

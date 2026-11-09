@@ -140,6 +140,25 @@ describe('pingPeer', () => {
         expect(http.post).toHaveBeenCalledTimes(2)
     })
 
+    it('gives each explicit peer message a distinct queue identity, even with identical text', async () => {
+        const session = { id: 'aaaaaaaa-1111-1111-1111-111111111111', active: true }
+        const messages: Array<{ text: string; localId: string }> = []
+        const http = createHttpMock({
+            get: url => ({ status: 200, data: url.endsWith('/api/sessions') ? { sessions: [session] } : { session } }),
+            post: (url, body) => {
+                if (url.endsWith('/api/auth')) return { status: 200, data: { token: 'synthetic-jwt' } }
+                messages.push(body as { text: string; localId: string })
+                return { status: 200, data: { ok: true } }
+            }
+        })
+        const args = { sessionIdPrefix: session.id, message: 'same explicit message', accessToken: 'synthetic', apiUrl: 'http://127.0.0.1:3006', http: http as never }
+        await pingPeer(args); await pingPeer(args)
+        expect(messages).toHaveLength(2)
+        expect(messages[0].localId).toMatch(/^ping-peer-[0-9a-f-]{36}$/)
+        expect(messages[1].localId).not.toBe(messages[0].localId)
+        expect(messages[0].text).toBe(messages[1].text)
+    })
+
     it.each([undefined, 'auto', 'queue'] as const)('resumes an inactive session with %s delivery, waits for active, then sends', async (deliveryMode) => {
         const sessionId = 'aaaaaaaa-1111-1111-1111-111111111111'
         let active = false

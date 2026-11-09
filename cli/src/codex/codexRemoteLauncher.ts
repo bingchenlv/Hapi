@@ -40,6 +40,7 @@ import {
     type RemoteLauncherExitReason
 } from '@/modules/common/remote/RemoteLauncherBase';
 import { CodexConversationHistory } from './conversationHistory';
+import { CodexRateLimitsTracker } from './utils/codexRateLimits';
 
 
 
@@ -366,6 +367,21 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         const messageBuffer = this.messageBuffer;
         const appServerClient = this.appServerClient;
         const appServerEventConverter = new AppServerEventConverter();
+        const rateLimitsTracker = new CodexRateLimitsTracker(
+            typeof session.client.getMetadata === 'function'
+                ? session.client.getMetadata()?.codexRateLimits
+                : undefined,
+            codexRateLimits => session.client.updateMetadata(metadata => ({ ...metadata, codexRateLimits }))
+        );
+        const refreshRateLimits = async (): Promise<void> => {
+            try {
+                await rateLimitsTracker.refresh(() => appServerClient.readRateLimits());
+            } catch (error) {
+                // API-key auth and older app-server builds may not expose this
+                // account endpoint. Quota UI is optional and must not block chat.
+                logger.debug(`[Codex] rate limits unavailable: ${errorMessage(error)}`);
+            }
+        };
 
         const normalizeCommand = (value: unknown): string | undefined => {
             if (typeof value === 'string') {
@@ -2058,6 +2074,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     experimentalApi: true
                 }
             });
+            void refreshRateLimits();
         };
 
         // Returns 'accepted' when the thread contains the steered user message
@@ -3546,6 +3563,10 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         };
 
         appServerClient.setNotificationHandler((method, params) => {
+            if (method === 'account/rateLimits/updated') {
+                rateLimitsTracker.acceptNotification(params);
+                return;
+            }
             if (method === 'skills/changed') {
                 void refreshNativeSkills(true).catch((error) => {
                     logger.debug(`[Codex] failed to refresh skills: ${errorMessage(error)}`);
@@ -3633,6 +3654,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 experimentalApi: true
             }
         });
+        void refreshRateLimits();
 
         let contextManagementConfig: CodexContextManagementConfig | undefined;
         try {

@@ -8,6 +8,9 @@ export function settingsMatch(actual: Record<string, unknown>, expected: Record<
         // null developer instructions select the native built-in instructions;
         // the effective snapshot is allowed to contain their expanded text.
         if (key === 'developer_instructions' && value === null) return true;
+        // Codex 0.160.0 reports a cleared tier as the explicit default.
+        // Only this field/value pair is equivalent; absent and priority are not.
+        if (key === 'serviceTier' && value === null && actual[key] === 'default') return true;
         if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
             return settingsMatch(record(actual[key]), record(value));
         }
