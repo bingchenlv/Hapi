@@ -1,0 +1,697 @@
+@import "tailwindcss";
+@import "katex/dist/katex.min.css";
+@config "../tailwind.config.ts";
+
+:root {
+    --app-bg: var(--tg-theme-bg-color, #ffffff);
+    --app-fg: var(--tg-theme-text-color, #111827);
+    --app-hint: var(--tg-theme-hint-color, #6b7280);
+    --app-link: var(--tg-theme-link-color, #111827);
+    --app-button: var(--tg-theme-button-color, #111827);
+    --app-button-text: var(--tg-theme-button-text-color, #ffffff);
+    --app-banner-bg: var(--tg-theme-button-color, #111827);
+    --app-banner-text: var(--tg-theme-button-text-color, #ffffff);
+    --app-secondary-bg: var(--tg-theme-secondary-bg-color, #f3f4f6);
+
+    --app-dialog-bg: #ffffff;
+    --app-chat-user-bg: #f2f4f6;
+    --app-chat-user-surface-bg: var(--app-chat-user-bg);
+    --app-chat-user-fg: #24292f;
+    --app-chat-user-chip-bg: #DBEAFE;
+    --app-chat-user-chip-fg: #1447E6;
+    --app-chat-user-chip-action-bg: #1d4ed8;
+    --app-chat-user-chip-action-fg: #bfdbfe;
+    --app-chat-user-chip-action-hover-fg: #fecaca;
+    --app-tool-card-bg: #f2f4f6;
+    --app-tool-group-bg: var(--app-tool-card-bg);
+    --app-tool-card-hover-bg: #e9edf2;
+    --app-tool-card-accent: #7b8491;
+    --app-tool-card-muted-action-fg: #aeb4bd;
+    --app-tool-card-subtitle: #6b7280;
+    --app-code-header-bg: #eceff2;
+    --app-code-header-fg: #717784;
+    --app-code-copy-hover-bg: rgba(17, 24, 39, 0.06);
+    --app-inline-code-border: transparent;
+    --app-inline-code-fg: #2d333b;
+    --app-md-quote-bg: #f1f3f5;
+    --app-md-quote-border: #c9d0d8;
+    --app-md-quote-fg: #525965;
+    --app-md-table-bg: #f5f6f7;
+    --app-md-table-head-bg: #eceff2;
+    --app-reasoning-bg: #f2f4f6;
+    --app-mermaid-node-fill: #f8fbff;
+    --app-mermaid-node-border: #b8cdfd;
+    --app-mermaid-cluster-fill: #eef4ff;
+    --app-mermaid-text: #2d333b;
+    --app-link-muted: rgba(17, 24, 39, 0.18);
+    --app-scrollbar-thumb: rgba(107, 114, 128, 0.34);
+    --app-scrollbar-thumb-hover: rgba(107, 114, 128, 0.5);
+
+    /* Theme-aware colors (light mode defaults) */
+    --app-border: rgba(15, 23, 42, 0.08);
+    --app-divider: rgba(15, 23, 42, 0.08);
+    --app-subtle-bg: rgba(15, 23, 42, 0.04);
+    --app-code-bg: #f5f6f7;
+    --app-inline-code-bg: #ebecef;
+
+    /* Diff colors (light) - from hapi-app */
+    --app-diff-added-bg: #e6ffed;
+    --app-diff-added-text: #24292e;
+    --app-diff-removed-bg: #ffeef0;
+    --app-diff-removed-text: #24292e;
+
+    /* Git status colors (light) */
+    --app-git-staged-color: #34C759;
+    --app-git-unstaged-color: #FF9500;
+    --app-git-deleted-color: #FF3B30;
+    --app-git-renamed-color: #2563eb;
+    --app-git-untracked-color: #8E8E93;
+
+    /* Badge colors (light) */
+    --app-badge-warning-bg: rgba(245, 158, 11, 0.2);
+    --app-badge-warning-text: #b45309;
+    --app-badge-warning-border: rgba(245, 158, 11, 0.3);
+    --app-badge-success-bg: rgba(34, 197, 94, 0.2);
+    --app-badge-success-text: #15803d;
+    --app-badge-success-border: rgba(34, 197, 94, 0.3);
+    --app-badge-error-bg: rgba(239, 68, 68, 0.18);
+    --app-badge-error-text: #b91c1c;
+    --app-badge-error-border: rgba(239, 68, 68, 0.3);
+
+    --app-font-scale: 1;
+    --app-chat-font-size: 0.9375rem;
+    --app-chat-line-height: 1.75rem;
+    --app-message-action-size: 1.125rem;
+}
+
+[data-theme="dark"] {
+    /* Primary colors - override fallbacks for non-Telegram browsers */
+    --app-bg: var(--tg-theme-bg-color, #1c1c1e);
+    --app-fg: var(--tg-theme-text-color, #ffffff);
+    --app-hint: var(--tg-theme-hint-color, #8e8e93);
+    --app-link: var(--tg-theme-link-color, #ffffff);
+    --app-button: var(--tg-theme-button-color, #ffffff);
+    --app-button-text: var(--tg-theme-button-text-color, #111827);
+    --app-banner-bg: var(--tg-theme-button-color, #3A3A3C);
+    --app-banner-text: var(--tg-theme-button-text-color, #ffffff);
+    --app-secondary-bg: var(--tg-theme-secondary-bg-color, #2C2C2E);
+
+    --app-dialog-bg: #202226;
+    --app-chat-user-bg: #2b2f34;
+    --app-chat-user-surface-bg: var(--app-chat-user-bg);
+    --app-chat-user-fg: #f5f7fa;
+    --app-chat-user-chip-bg: rgba(37, 99, 235, 0.22);
+    --app-chat-user-chip-fg: #93c5fd;
+    --app-chat-user-chip-action-bg: #171f32;
+    --app-chat-user-chip-action-fg: #7088aa;
+    --app-chat-user-chip-action-hover-fg: #f87171;
+    --app-tool-card-bg: #2b2f34;
+    --app-tool-group-bg: var(--app-tool-card-bg);
+    --app-tool-card-hover-bg: #343a41;
+    --app-tool-card-accent: #b8c0cb;
+    --app-tool-card-muted-action-fg: #7f8792;
+    --app-tool-card-subtitle: #b3bac5;
+    --app-code-header-bg: #353b43;
+    --app-code-header-fg: #c4cbd6;
+    --app-code-copy-hover-bg: rgba(255, 255, 255, 0.08);
+    --app-inline-code-border: transparent;
+    --app-inline-code-fg: #f5f7fa;
+    --app-md-quote-bg: #31363d;
+    --app-md-quote-border: #6b7481;
+    --app-md-quote-fg: #d7dde6;
+    --app-md-table-bg: #2a2f35;
+    --app-md-table-head-bg: #353b43;
+    --app-reasoning-bg: #2b3036;
+    --app-mermaid-node-fill: #323843;
+    --app-mermaid-node-border: #7aa2ff;
+    --app-mermaid-cluster-fill: #2d3440;
+    --app-mermaid-text: #edf1f5;
+    --app-link-muted: rgba(255, 255, 255, 0.2);
+    --app-scrollbar-thumb: rgba(196, 203, 214, 0.28);
+    --app-scrollbar-thumb-hover: rgba(196, 203, 214, 0.42);
+
+    --app-border: rgba(255, 255, 255, 0.08);
+    --app-divider: rgba(255, 255, 255, 0.08);
+    --app-subtle-bg: rgba(255, 255, 255, 0.05);
+    --app-code-bg: #2a2f35;
+    --app-inline-code-bg: #383e47;
+
+    /* Diff colors (dark) - from hapi-app */
+    --app-diff-added-bg: #0d2e1f;
+    --app-diff-added-text: #c9d1d9;
+    --app-diff-removed-bg: #3f1b23;
+    --app-diff-removed-text: #c9d1d9;
+
+    /* Git status colors (dark) */
+    --app-git-staged-color: #4ade80;
+    --app-git-unstaged-color: #f59e0b;
+    --app-git-deleted-color: #f87171;
+    --app-git-renamed-color: #60a5fa;
+    --app-git-untracked-color: #9ca3af;
+
+    /* Badge colors (dark) */
+    --app-badge-warning-bg: rgba(251, 191, 36, 0.2);
+    --app-badge-warning-text: #fbbf24;
+    --app-badge-warning-border: rgba(251, 191, 36, 0.3);
+    --app-badge-success-bg: rgba(74, 222, 128, 0.2);
+    --app-badge-success-text: #4ade80;
+    --app-badge-success-border: rgba(74, 222, 128, 0.3);
+    --app-badge-error-bg: rgba(248, 113, 113, 0.2);
+    --app-badge-error-text: #fca5a5;
+    --app-badge-error-border: rgba(248, 113, 113, 0.35);
+}
+
+[data-theme="oled"] {
+    /*
+     * Pure-black canvas for OLED panels. Unlike Dark mode we never defer to
+     * --tg-theme-* here, otherwise Telegram's gray backgrounds would defeat the
+     * point of OLED black. Elevation comes from borders, not gray fills.
+     */
+    --app-bg: #000000;
+    --app-fg: #f5f5f7;
+    --app-hint: #8e8e93;
+    --app-link: #4ea1ff;
+    --app-button: #4ea1ff;
+    --app-button-text: #000000;
+    --app-banner-bg: #1a1a1c;
+    --app-banner-text: #f5f5f7;
+    --app-secondary-bg: #0a0a0b;
+
+    --app-dialog-bg: #0c0c0e;
+    --app-chat-user-bg: #141414;
+    --app-chat-user-surface-bg: var(--app-chat-user-bg);
+    --app-chat-user-fg: #f5f7fa;
+    --app-chat-user-chip-bg: rgba(78, 161, 255, 0.18);
+    --app-chat-user-chip-fg: #8fc4ff;
+    --app-chat-user-chip-action-bg: #0d1428;
+    --app-chat-user-chip-action-fg: #7088aa;
+    --app-chat-user-chip-action-hover-fg: #f87171;
+    --app-tool-card-bg: #0e0e10;
+    --app-tool-group-bg: var(--app-tool-card-bg);
+    --app-tool-card-hover-bg: #161618;
+    --app-tool-card-accent: #b8c0cb;
+    --app-tool-card-muted-action-fg: #6b6f78;
+    --app-tool-card-subtitle: #9aa0aa;
+    --app-code-header-bg: #161618;
+    --app-code-header-fg: #c4cbd6;
+    --app-code-copy-hover-bg: rgba(255, 255, 255, 0.08);
+    --app-inline-code-border: transparent;
+    --app-inline-code-fg: #f5f7fa;
+    --app-md-quote-bg: #131316;
+    --app-md-quote-border: #3a3a40;
+    --app-md-quote-fg: #d7dde6;
+    --app-md-table-bg: #0e0e10;
+    --app-md-table-head-bg: #161618;
+    --app-reasoning-bg: #0e0e10;
+    --app-mermaid-node-fill: #16181d;
+    --app-mermaid-node-border: #4ea1ff;
+    --app-mermaid-cluster-fill: #101216;
+    --app-mermaid-text: #edf1f5;
+    --app-link-muted: rgba(255, 255, 255, 0.22);
+    --app-scrollbar-thumb: rgba(196, 203, 214, 0.24);
+    --app-scrollbar-thumb-hover: rgba(196, 203, 214, 0.4);
+
+    --app-border: rgba(255, 255, 255, 0.12);
+    --app-divider: rgba(255, 255, 255, 0.1);
+    --app-subtle-bg: rgba(255, 255, 255, 0.06);
+    --app-code-bg: #0e0e10;
+    --app-inline-code-bg: #1a1a1d;
+
+    /* Diff colors (oled) */
+    --app-diff-added-bg: #07251a;
+    --app-diff-added-text: #c9d1d9;
+    --app-diff-removed-bg: #2c1217;
+    --app-diff-removed-text: #c9d1d9;
+
+    /* Git status colors (reuse dark hues) */
+    --app-git-staged-color: #4ade80;
+    --app-git-unstaged-color: #f59e0b;
+    --app-git-deleted-color: #f87171;
+    --app-git-renamed-color: #60a5fa;
+    --app-git-untracked-color: #9ca3af;
+
+    /* Badge colors (reuse dark hues, lower bg opacity) */
+    --app-badge-warning-bg: rgba(251, 191, 36, 0.16);
+    --app-badge-warning-text: #fbbf24;
+    --app-badge-warning-border: rgba(251, 191, 36, 0.28);
+    --app-badge-success-bg: rgba(74, 222, 128, 0.16);
+    --app-badge-success-text: #4ade80;
+    --app-badge-success-border: rgba(74, 222, 128, 0.28);
+    --app-badge-error-bg: rgba(248, 113, 113, 0.16);
+    --app-badge-error-text: #fca5a5;
+    --app-badge-error-border: rgba(248, 113, 113, 0.3);
+}
+
+html {
+    font-size: calc(100% * var(--app-font-scale, 1));
+    color-scheme: light;
+    scrollbar-color: var(--app-scrollbar-thumb) transparent;
+    scrollbar-width: thin;
+}
+
+[data-theme="dark"],
+[data-theme="oled"] {
+    color-scheme: dark;
+}
+
+* {
+    scrollbar-color: var(--app-scrollbar-thumb) transparent;
+    scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+    background-color: var(--app-scrollbar-thumb);
+    border: 3px solid transparent;
+    border-radius: 999px;
+    background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+    background-color: var(--app-scrollbar-thumb-hover);
+}
+
+*::-webkit-scrollbar-corner {
+    background: transparent;
+}
+
+button, [role="button"] {
+    cursor: pointer;
+}
+
+html,
+body {
+    height: 100vh;
+    height: 100dvh;
+    height: var(--app-viewport-height, 100dvh);
+    height: var(--tg-viewport-stable-height, var(--app-viewport-height, 100dvh));
+    touch-action: pan-x pan-y;
+    overscroll-behavior: none;
+    -webkit-text-size-adjust: 100%;
+}
+
+html[data-telegram-app="true"],
+html[data-telegram-app="true"] body {
+    overflow: hidden;
+}
+
+html:not([data-telegram-app="true"]),
+html:not([data-telegram-app="true"]) body {
+    overflow-x: hidden;
+    overflow-y: auto;
+}
+
+body {
+    font-size: 1rem;
+    background: var(--app-bg);
+    color: var(--app-fg);
+}
+
+#root {
+    height: 100%;
+}
+
+/* Chat viewports own vertical scrolling; keep transiently oversized messages
+ * from creating a second document scrollbar without locking non-chat routes. */
+html:has(.chat-scroll-y),
+html:has(.chat-scroll-y) body,
+html:has(.chat-scroll-y) #root {
+    overflow: hidden;
+}
+
+.app-scroll-y {
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+}
+
+/* On touch-first devices, keep the chat scrollbar from shifting centered content. */
+@media (hover: none) and (pointer: coarse) {
+    .chat-scroll-y {
+        scrollbar-gutter: stable both-edges;
+    }
+
+    .chat-scroll-content {
+        padding-inline: max(
+            0.125rem,
+            calc(0.75rem - var(--chat-scroll-gutter-inline, 0px))
+        );
+    }
+}
+
+@media (hover: hover) and (pointer: fine) {
+    .session-list-item:hover,
+    .session-list-new-button:hover {
+        background-color: var(--app-subtle-bg);
+    }
+}
+
+/* Collapsible panel animation */
+.collapsible-panel {
+    display: grid;
+    grid-template-rows: 0fr;
+    transition: grid-template-rows 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.collapsible-panel[data-open] {
+    grid-template-rows: 1fr;
+}
+
+.collapsible-panel > .collapsible-inner {
+    overflow: hidden;
+    opacity: 0;
+    transition: opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.collapsible-panel[data-open] > .collapsible-inner {
+    opacity: 1;
+}
+
+/* Scale content area to use available space on wide screens */
+@media (min-width: 1280px) {
+    :root {
+        --content-max-w: min(90%, 1200px);
+    }
+}
+
+/* Keep the session list scrollbar on the left at every viewport size. */
+.session-list-scrollbar-left {
+    direction: rtl;
+    scrollbar-gutter: stable;
+}
+
+.session-list-scrollbar-left > * {
+    direction: ltr;
+}
+
+/* Match fixed sidebar controls to the space reserved for the left scrollbar. */
+.session-list-scrollbar-offset {
+    padding-left: 8px;
+}
+
+/* Desktop sidebar: use custom width from CSS variable.
+   Kept in sync with the Tailwind `split` breakpoint (see tailwind.config.ts)
+   so the sidebar width/resize applies as soon as the split view appears on
+   compact tablets. */
+@media (min-width: 920px) {
+    /* Apply resizable width to sidebar.
+       Cap it against the viewport so a wide persisted width (up to 600px, from
+       resizing on desktop) can't crush the detail pane on a compact split.
+       424px = 420px min detail pane + 4px resize handle, which preserves the
+       previous 1024px worst case (1024 - 600 - 4 = 420) down to 920px. The cap
+       is a no-op on desktop where 100vw - 424px exceeds the stored width. */
+    div[style*="--sidebar-w"] {
+        width: min(var(--sidebar-w), calc(100vw - 424px)) !important;
+    }
+}
+
+/* Sidebar resize handle */
+.sidebar-resize-handle {
+    width: 4px;
+    cursor: col-resize;
+    background: var(--app-divider);
+    transition: background-color 0.15s;
+}
+
+.sidebar-resize-handle:hover,
+.sidebar-resize-handle[data-dragging] {
+    background: var(--app-link);
+}
+
+.sidebar-resize-handle[data-dragging] {
+    opacity: 0.6;
+}
+
+/*
+ * Keep message layout fully realized while scrolling. `content-visibility: auto`
+ * made Chromium replace rough intrinsic heights as older messages entered view,
+ * which could change scrollTop and bounce the chat away from the user's target.
+ */
+.happy-thread-messages > * {
+    overflow-anchor: none;
+}
+
+/* Markdown styles */
+.markdown-content a { color: var(--app-link); text-decoration: underline; }
+.markdown-content code { background: var(--app-inline-code-bg); padding: 0.1em 0.3em; border-radius: 4px; font-size: 0.9em; }
+.markdown-content blockquote { border-left: 3px solid var(--app-hint); padding-left: 0.75rem; margin: 0.5rem 0; opacity: 0.85; }
+.markdown-content ul, .markdown-content ol { padding-left: 1.5rem; margin: 0.5rem 0; }
+.markdown-content table { border-collapse: collapse; width: 100%; }
+.markdown-content th, .markdown-content td { border: 1px solid var(--app-border); padding: 0.25rem 0.5rem; }
+
+.aui-md {
+    color: var(--app-fg);
+    font-size: var(--app-chat-font-size);
+    line-height: var(--app-chat-line-height);
+}
+
+.happy-chat-text {
+    font-size: var(--app-chat-font-size);
+    line-height: var(--app-chat-line-height);
+}
+
+
+.tool-result-quote :where(.aui-md, .aui-md-p, .aui-md-li, .aui-md-td, .aui-md-th, .aui-md-strong, .aui-md-em, .aui-md-h1, .aui-md-h2, .aui-md-h3, .aui-md-h4, .aui-md-h5, .aui-md-h6) {
+    color: inherit;
+    font-size: inherit;
+    line-height: inherit;
+}
+
+.tool-result-quote :where(.aui-md-table) {
+    font-size: inherit;
+}
+
+.tool-result-quote :where(.aui-md-a) {
+    color: var(--app-link);
+}
+
+.happy-message-actions-first-line {
+    align-self: flex-start;
+    margin-top: max(0px, calc((var(--app-chat-line-height) - var(--app-message-action-size)) / 2));
+}
+
+@media (hover: hover) and (pointer: fine) {
+    .happy-message-actions {
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 150ms ease;
+    }
+
+    .happy-message:hover .happy-message-actions,
+    .happy-message:focus-within .happy-message-actions {
+        opacity: 1;
+        pointer-events: auto;
+    }
+}
+
+.aui-md :where(.contains-task-list) {
+    list-style: none;
+    padding-left: 0;
+}
+
+.aui-md :where(input[type="checkbox"]) {
+    margin-right: 0.55rem;
+}
+
+.aui-md :where(.katex-display) {
+    margin: 0.9rem 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 0.15rem;
+}
+
+.aui-md :where(pre) {
+    white-space: pre;
+}
+
+.aui-md :where(p + ul, p + ol, p + blockquote, p + .aui-md-table-wrapper) {
+    margin-top: 0.85rem;
+}
+
+.aui-mermaid-diagram svg {
+    height: auto;
+}
+
+.aui-mermaid-diagram svg .node rect,
+.aui-mermaid-diagram svg .node circle,
+.aui-mermaid-diagram svg .node ellipse,
+.aui-mermaid-diagram svg .node polygon,
+.aui-mermaid-diagram svg .label-container {
+    fill: var(--app-mermaid-node-fill) !important;
+    stroke: var(--app-mermaid-node-border) !important;
+}
+
+.aui-mermaid-diagram svg .cluster rect,
+.aui-mermaid-diagram svg .cluster polygon {
+    fill: var(--app-mermaid-cluster-fill) !important;
+    stroke: var(--app-mermaid-node-border) !important;
+}
+
+.aui-mermaid-diagram svg .nodeLabel,
+.aui-mermaid-diagram svg .label,
+.aui-mermaid-diagram svg .label text,
+.aui-mermaid-diagram svg text {
+    fill: var(--app-mermaid-text) !important;
+    color: var(--app-mermaid-text) !important;
+}
+
+.happy-user-bubble .aui-md {
+    color: inherit;
+}
+
+.aui-md-codeblock .shiki,
+.aui-md-codeblock .shiki span:not([data-line-number]) {
+    background-color: transparent !important;
+}
+
+/* Shiki dual theme colors */
+.shiki,
+.shiki span:not([data-line-number]) {
+    color: var(--shiki-light) !important;
+    font-style: var(--shiki-light-font-style) !important;
+    font-weight: var(--shiki-light-font-weight) !important;
+    text-decoration: var(--shiki-light-text-decoration) !important;
+}
+
+html[data-theme="dark"] .shiki,
+html[data-theme="dark"] .shiki span:not([data-line-number]),
+html[data-theme="oled"] .shiki,
+html[data-theme="oled"] .shiki span:not([data-line-number]) {
+    color: var(--shiki-dark) !important;
+    font-style: var(--shiki-dark-font-style) !important;
+    font-weight: var(--shiki-dark-font-weight) !important;
+    text-decoration: var(--shiki-dark-text-decoration) !important;
+}
+
+/* Ultrathink rainbow sparkle effect - per-letter wave animation */
+@keyframes rainbow-wave {
+  0% { color: #ff5555; }      /* red */
+  14% { color: #ffaa00; }     /* orange */
+  28% { color: #ffff55; }     /* yellow */
+  42% { color: #55ff55; }     /* green */
+  57% { color: #55ffff; }     /* cyan */
+  71% { color: #5555ff; }     /* blue */
+  85% { color: #ff55ff; }     /* magenta/pink */
+  100% { color: #ff5555; }    /* red */
+}
+
+@keyframes sparkle-wave {
+  0%, 100% {
+    filter: brightness(1);
+  }
+  50% {
+    filter: brightness(0.7);
+  }
+}
+
+.rainbow-letter {
+  display: inline-block;
+  animation: rainbow-wave 2s linear infinite, sparkle-wave 2s ease-in-out infinite;
+  font-weight: 600;
+}
+
+/* PWA install prompt animation */
+@keyframes slide-up {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.3s ease-out;
+}
+
+@keyframes menu-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-menu-pop {
+  animation: menu-pop 0.18s ease-out;
+}
+
+/* Syncing spinner animation */
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+.animate-spin-slow {
+  animation: spin 2s linear infinite;
+}
+
+/* New messages indicator bounce animation */
+@keyframes bounce-in {
+  0% {
+    transform: translateX(-50%) scale(0.8);
+    opacity: 0;
+  }
+  50% {
+    transform: translateX(-50%) scale(1.05);
+  }
+  100% {
+    transform: translateX(-50%) scale(1);
+    opacity: 1;
+  }
+}
+
+.animate-bounce-in {
+  animation: bounce-in 0.3s ease-out;
+}
+
+/* ReactQueryDevtools button - move to middle-right to avoid blocking UI */
+.tsqd-open-btn-container {
+  bottom: 50% !important;
+  transform: translateY(50%);
+}
+
+/* Composer attachment controls stay discoverable on touch, but stay quiet
+   until the attachment is targeted on mouse-driven layouts. */
+@media (hover: hover) and (pointer: fine) {
+  .hapi-composer-attachment-control {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 150ms ease;
+  }
+
+  [data-hapi-composer-attachment-id]:hover .hapi-composer-attachment-control,
+  [data-hapi-composer-attachment-id]:focus-within .hapi-composer-attachment-control,
+  [data-hapi-composer-attachment-dragging] .hapi-composer-attachment-control {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .hapi-composer-attachment-control.hapi-composer-attachment-file-control {
+    opacity: 1;
+    pointer-events: auto;
+    transition: none;
+  }
+}

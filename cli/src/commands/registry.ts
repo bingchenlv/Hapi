@@ -1,0 +1,86 @@
+import chalk from 'chalk'
+import { agyCommand } from './agy'
+import { authCommand } from './auth'
+import { claudeCommand } from './claude'
+import { codexCommand } from './codex'
+import { dshCommand } from './dsh'
+import { cursorCommand } from './cursor'
+import { connectCommand } from './connect'
+import { runnerCommand } from './runner'
+import { resumeCommand } from './resume'
+import { doctorCommand } from './doctor'
+import { kimiCommand } from './kimi'
+import { copilotCommand } from './copilot'
+import { grokCommand } from './grok'
+import { opencodeCommand } from './opencode'
+import { piCommand } from './pi'
+import { hookForwarderCommand } from './hookForwarder'
+import { mcpCommand } from './mcp'
+import { mcpProxyCommand } from './mcpProxy'
+import { notifyCommand } from './notify'
+import { hubCommand } from './hub'
+import { pingPeerCommand } from './pingPeer'
+import { inspectPeerCommand } from './inspectPeer'
+import type { CommandContext, CommandDefinition } from './types'
+
+// Gemini CLI was sunset (Google stopped serving the consumer Gemini CLI on
+// 2026-06-18) so the agent is no longer launchable. Keep an explicit tombstone
+// command so `hapi gemini` explains why the agent is no longer available.
+const removedGeminiCommand: CommandDefinition = {
+    name: 'gemini',
+    requiresRuntimeAssets: false,
+    run: async () => {
+        console.error(
+            chalk.red('Error:'),
+            'Gemini CLI is no longer supported and cannot be launched (Google sunset the consumer Gemini CLI on 2026-06-18). Existing Gemini sessions remain viewable in the web UI.'
+        )
+        process.exit(1)
+    }
+}
+
+const COMMANDS: CommandDefinition[] = [
+    agyCommand,
+    authCommand,
+    claudeCommand,
+    connectCommand,
+    codexCommand,
+    dshCommand,
+    cursorCommand,
+    removedGeminiCommand,
+    grokCommand,
+    kimiCommand,
+    copilotCommand,
+    opencodeCommand,
+    piCommand,
+    mcpCommand,
+    mcpProxyCommand,
+    hubCommand,
+    { ...hubCommand, name: 'server' },
+    hookForwarderCommand,
+    doctorCommand,
+    resumeCommand,
+    runnerCommand,
+    notifyCommand,
+    pingPeerCommand,
+    inspectPeerCommand
+]
+
+const commandMap = new Map<string, CommandDefinition>()
+for (const command of COMMANDS) {
+    commandMap.set(command.name, command)
+}
+
+export function resolveCommand(args: string[]): { command: CommandDefinition; context: CommandContext } | null {
+    const subcommand = args[0]
+    const command = subcommand ? commandMap.get(subcommand) : undefined
+    if (!command) return null
+
+    return {
+        command,
+        context: {
+            args,
+            subcommand,
+            commandArgs: args.slice(1)
+        }
+    }
+}

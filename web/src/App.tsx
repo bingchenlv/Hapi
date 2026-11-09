@@ -1,0 +1,540 @@
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Outlet, useLocation, useMatchRoute, useRouter } from '@tanstack/react-router'
+import { useQueryClient } from '@tanstack/react-query'
+import { getTelegramWebApp, isTelegramApp } from '@/hooks/useTelegram'
+import { initializeChatSurfaceColors } from '@/hooks/useChatSurfaceColors'
+import { initializeTheme } from '@/hooks/useTheme'
+import { initializeThemeColors } from '@/hooks/useThemeColors'
+import { useAuth } from '@/hooks/useAuth'
+import { useAuthSource } from '@/hooks/useAuthSource'
+import { useServerUrl } from '@/hooks/useServerUrl'
+import { useSSE } from '@/hooks/useSSE'
+import { useSessions } from '@/hooks/queries/useSessions'
+import { useReconnectingState } from '@/hooks/useReconnectingState'
+import { useSyncingState } from '@/hooks/useSyncingState'
+import { usePushNotifications } from '@/hooks/usePushNotifications'
+import { useViewportHeight } from '@/hooks/useViewportHeight'
+import { useVisibilityReporter } from '@/hooks/useVisibilityReporter'
+import { queryKeys } from '@/lib/query-keys'
+import { refreshAllAgyCatalogs } from '@/lib/agyCatalogAnnouncement'
+import { AppContextProvider } from '@/lib/app-context'
+import { clearMessageWindow, rewindMessageWindow, syncTailMessages } from '@/lib/message-window-store'
+import { useAppGoBack } from '@/hooks/useAppGoBack'
+import { useTranslation } from '@/lib/use-translation'
+import { translateInputRequestTitle } from '@/lib/input-request-toast'
+import { VoiceProvider } from '@/lib/voice-context'
+import { requireHubUrlForLogin } from '@/lib/runtime-config'
+import { getAppGlobalSseSubscription, getAppSessionSseSubscription } from '@/lib/appSseSubscriptions'
+import { canUseAppBadging, useAppBadge } from '@/hooks/useAppBadge'
+import { useAppBadgePreference } from '@/hooks/useAppBadgePreference'
+import { reconcileQueuedStateAfterConnect } from '@/lib/queued-state-reconciliation'
+import { LoginPrompt } from '@/components/LoginPrompt'
+import { InstallPrompt } from '@/components/InstallPrompt'
+import { OfflineBanner } from '@/components/OfflineBanner'
+import { PwaUpdateBanner, PwaUpdateBannerWithStatusOffset } from '@/components/PwaUpdateBanner'
+import { SyncingBanner } from '@/components/SyncingBanner'
+import { ReconnectingBanner } from '@/components/ReconnectingBanner'
+import { VoiceErrorBanner } from '@/components/VoiceErrorBanner'
+import { RunnerVersionSkewBanner } from '@/components/RunnerVersionSkewBanner'
+import { LoadingState } from '@/components/LoadingState'
+import { ToastContainer } from '@/components/ToastContainer'
+import { PwaUpdateProvider } from '@/lib/pwa-update-context'
+import { ToastProvider, useToast } from '@/lib/toast-context'
+import type { SyncEvent } from '@/types/api'
+
+type ToastEvent = Extract<SyncEvent, { type: 'toast' }>
+
+const REQUIRE_SERVER_URL = requireHubUrlForLogin()
+
+function withPwaBanner(content: ReactNode) {
+    return (
+        <>
+            <PwaUpdateBanner />
+            {content}
+        </>
+    )
+}
+
+export function App() {
+    return (
+        <ToastProvider>
+            <PwaUpdateProvider>
+                <AppInner />
+            </PwaUpdateProvider>
+        </ToastProvider>
+    )
+}
+
+function AppInner() {
+    const { t } = useTranslation()
+    const { serverUrl, baseUrl, setServerUrl, clearServerUrl } = useServerUrl()
+    const { authSource, isLoading: isAuthSourceLoading, setAccessToken } = useAuthSource(baseUrl)
+    const { token, api, isLoading: isAuthLoading, error: authError, needsBinding, bind } = useAuth(authSource, baseUrl)
+    const [titleSuggestionAvailable, setTitleSuggestionAvailable] = useState(false)
+    const goBack = useAppGoBack()
+    const pathname = useLocation({ select: (location) => location.pathname })
+    const matchRoute = useMatchRoute()
+    const router = useRouter()
+    const { addToast } = useToast()
+
+    useEffect(() => {
+        let cancelled = false
+        setTitleSuggestionAvailable(false)
+        if (!api) return () => { cancelled = true }
+
+        void api.getHealth()
+            .then((health) => {
+                if (!cancelled) {
+                    setTitleSuggestionAvailable(health.capabilities?.titleSuggestion === true)
+                }
+            })
+            .catch(() => {
+                if (!cancelled) setTitleSuggestionAvailable(false)
+            })
+
+        return () => {
+            cancelled = true
+        }
+    }, [api])
+
+    useEffect(() => {
+        const tg = getTelegramWebApp()
+        tg?.ready()
+        tg?.expand()
+        initializeTheme()
+        initializeThemeColors()
+        initializeChatSurfaceColors()
+    }, [])
+
+    // Track visual viewport height for mobile keyboard avoidance (see useViewportHeight.ts)
+    useViewportHeight()
+
+    useEffect(() => {
+        const preventDefault = (event: Event) => {
+            event.preventDefault()
+        }
+
+        const onWheel = (event: WheelEvent) => {
+            if (event.ctrlKey) {
+                event.preventDefault()
+            }
+        }
+
+        const onKeyDown = (event: KeyboardEvent) => {
+            const modifier = event.ctrlKey || event.metaKey
+            if (!modifier) return
+            if (event.key === '+' || event.key === '-' || event.key === '=' || event.key === '0') {
+                event.preventDefault()
+            }
+        }
+
+        document.addEventListener('gesturestart', preventDefault as EventListener, { passive: false })
+        document.addEventListener('gesturechange', preventDefault as EventListener, { passive: false })
+        document.addEventListener('gestureend', preventDefault as EventListener, { passive: false })
+
+        window.addEventListener('wheel', onWheel, { passive: false })
+        window.addEventListener('keydown', onKeyDown)
+
+        return () => {
+            document.removeEventListener('gesturestart', preventDefault as EventListener)
+            document.removeEventListener('gesturechange', preventDefault as EventListener)
+            document.removeEventListener('gestureend', preventDefault as EventListener)
+
+            window.removeEventListener('wheel', onWheel)
+            window.removeEventListener('keydown', onKeyDown)
+        }
+    }, [])
+
+    useEffect(() => {
+        const tg = getTelegramWebApp()
+        const backButton = tg?.BackButton
+        if (!backButton) return
+
+        if (pathname === '/' || pathname === '/sessions') {
+            backButton.offClick(goBack)
+            backButton.hide()
+            return
+        }
+
+        backButton.show()
+        backButton.onClick(goBack)
+        return () => {
+            backButton.offClick(goBack)
+            backButton.hide()
+        }
+    }, [goBack, pathname])
+    const queryClient = useQueryClient()
+    const sessionMatch = matchRoute({ to: '/sessions/$sessionId' })
+    const selectedSessionId = sessionMatch && sessionMatch.sessionId !== 'new' ? sessionMatch.sessionId : null
+    const { isSyncing, startSync, endSync } = useSyncingState()
+    const {
+        isReconnecting: sseDisconnected,
+        reason: sseDisconnectReason,
+        reportConnect: reportSseConnect,
+        reportDisconnect: reportSseDisconnect
+    } = useReconnectingState()
+    const syncTokenRef = useRef(0)
+    const isFirstConnectRef = useRef(true)
+    const baseUrlRef = useRef(baseUrl)
+    const pushPromptedRef = useRef(false)
+    const { appBadgeEnabled: appBadgePreferenceEnabled } = useAppBadgePreference()
+    const appBadgeEnabled = Boolean(api && token && appBadgePreferenceEnabled && canUseAppBadging())
+    const {
+        sessions: appBadgeSessions,
+        isLoading: appBadgeSessionsLoading,
+        error: appBadgeSessionsError,
+    } = useSessions(api, { enabled: appBadgeEnabled })
+    useAppBadge({
+        enabled: appBadgeEnabled,
+        scope: baseUrl,
+        sessions: appBadgeSessions,
+        isLoading: appBadgeSessionsLoading,
+        hasError: Boolean(appBadgeSessionsError),
+    })
+    const { isSupported: isPushSupported, permission: pushPermission, requestPermission, subscribe } = usePushNotifications(api)
+
+    useEffect(() => {
+        if (baseUrlRef.current === baseUrl) {
+            return
+        }
+        baseUrlRef.current = baseUrl
+        isFirstConnectRef.current = true
+        syncTokenRef.current = 0
+        queryClient.clear()
+    }, [baseUrl, queryClient])
+
+    // Clean up URL params after successful auth (for direct access links)
+    useEffect(() => {
+        if (!token || !api) return
+        const { pathname, search, hash, state } = router.history.location
+        const searchParams = new URLSearchParams(search)
+        if (!searchParams.has('server') && !searchParams.has('hub') && !searchParams.has('token')) {
+            return
+        }
+        searchParams.delete('server')
+        searchParams.delete('hub')
+        searchParams.delete('token')
+        const nextSearch = searchParams.toString()
+        const nextHref = `${pathname}${nextSearch ? `?${nextSearch}` : ''}${hash}`
+        router.history.replace(nextHref, state)
+    }, [token, api, router])
+
+    useEffect(() => {
+        if (!api || !token) {
+            pushPromptedRef.current = false
+            return
+        }
+        if (isTelegramApp() || !isPushSupported) {
+            return
+        }
+        if (pushPromptedRef.current) {
+            return
+        }
+        pushPromptedRef.current = true
+
+        const run = async () => {
+            if (pushPermission === 'granted') {
+                await subscribe()
+                return
+            }
+            if (pushPermission === 'default') {
+                const granted = await requestPermission()
+                if (granted) {
+                    await subscribe()
+                }
+            }
+        }
+
+        void run()
+    }, [api, isPushSupported, pushPermission, requestPermission, subscribe, token])
+
+    const handleSseConnect = useCallback((info: { resumed: boolean }) => {
+        // Clear disconnected state on successful connection
+        reportSseConnect()
+
+        // The hub replayed every event missed during the gap, so the caches
+        // are already consistent - the full refetch below would only re-download
+        // what the replay just delivered. First connects and long gaps arrive
+        // with resumed=false and take the resync path.
+        if (info.resumed && !isFirstConnectRef.current) {
+            return
+        }
+
+        // Increment token to track this specific connection
+        const token = ++syncTokenRef.current
+
+        // Only force show banner on first connect (page load)
+        // Subsequent connects (session switches) use non-forced mode
+        // which only shows banner when returning from background
+        if (isFirstConnectRef.current) {
+            isFirstConnectRef.current = false
+            startSync({ force: true })
+        } else {
+            startSync()
+        }
+        const invalidations = [
+            queryClient.invalidateQueries({ queryKey: queryKeys.sessions }),
+            // Invalidate ALL cached session-detail entries on reconnect, not just
+            // the selected one.  With `SESSION_DETAIL_STALE_TIME_MS` extending the
+            // freshness window on `useSession`, a previously-viewed session that
+            // received updates during the SSE gap would otherwise serve stale
+            // cached data on remount.  See tiann/hapi#884.
+            queryClient.invalidateQueries({ queryKey: ['session'] }),
+            refreshAllAgyCatalogs(queryClient)
+        ]
+        const refreshMessages = (selectedSessionId && api)
+            ? syncTailMessages(api, selectedSessionId)
+            : Promise.resolve()
+        Promise.all([...invalidations, refreshMessages])
+            .catch((error) => {
+                console.error('Failed to invalidate queries on SSE connect:', error)
+            })
+            .finally(() => {
+                // Only end sync if this is still the latest connection
+                if (syncTokenRef.current === token) {
+                    endSync()
+                }
+            })
+    }, [api, queryClient, selectedSessionId, startSync, endSync, reportSseConnect])
+
+    const handleSseDisconnect = useCallback((reason: string) => {
+        // Only show reconnecting banner if we've already connected once
+        if (!isFirstConnectRef.current) {
+            reportSseDisconnect(reason)
+        }
+    }, [reportSseDisconnect])
+
+    const handleSseEvent = useCallback((event: SyncEvent) => {
+        if (event.type !== 'messages-invalidated') {
+            return
+        }
+        if (!api || event.sessionId !== selectedSessionId) {
+            return
+        }
+        if (event.reason === 'rewind' && event.truncateFromLocalId) {
+            rewindMessageWindow(event.sessionId, event.truncateFromLocalId)
+        } else {
+            clearMessageWindow(event.sessionId)
+        }
+        void syncTailMessages(api, event.sessionId)
+    }, [api, selectedSessionId])
+
+    const handleSessionSseConnect = useCallback((info: { resumed: boolean }) => {
+        if (!api || !selectedSessionId) {
+            return
+        }
+        // A resumed connection replayed messages-consumed/message events for
+        // this session, so the queued-state snapshot cannot have drifted.
+        if (info.resumed) {
+            return
+        }
+        void reconcileQueuedStateAfterConnect(api, selectedSessionId).catch((error) => {
+            console.error('Failed to reconcile queued state after SSE connect:', error)
+        })
+    }, [api, selectedSessionId])
+
+    const translateIncomingToast = useCallback((title: string, body: string): { title: string; body: string } => {
+        const normalizedTitle = title.trim()
+        const normalizedBody = body.trim()
+        const inputTitle = translateInputRequestTitle(normalizedTitle, t)
+        if (inputTitle) {
+            return { title: inputTitle, body: normalizedBody }
+        }
+
+        if (normalizedTitle === 'Ready for input') {
+            const waitingMatch = normalizedBody.match(/^(.+)\s+is waiting in\s+(.+)$/i)
+            if (waitingMatch) {
+                const agent = waitingMatch[1]?.trim() ?? ''
+                const sessionName = waitingMatch[2]?.trim() ?? ''
+                return {
+                    title: t('toast.ready.title'),
+                    body: t('toast.ready.body', { agent, session: sessionName })
+                }
+            }
+            return {
+                title: t('toast.ready.title'),
+                body: normalizedBody
+            }
+        }
+
+        if (normalizedTitle === 'Permission Request') {
+            return {
+                title: t('toast.permission.title'),
+                body: normalizedBody
+            }
+        }
+
+        if (normalizedTitle === 'Task completed') {
+            return {
+                title: t('toast.task.completed'),
+                body: normalizedBody
+            }
+        }
+
+        if (normalizedTitle === 'Task failed') {
+            return {
+                title: t('toast.task.failed'),
+                body: normalizedBody
+            }
+        }
+
+        return { title, body }
+    }, [t])
+
+    const handleToast = useCallback((event: ToastEvent) => {
+        const localized = translateIncomingToast(event.data.title, event.data.body)
+        addToast({
+            title: localized.title,
+            body: localized.body,
+            sessionId: event.data.sessionId,
+            url: event.data.url
+        })
+    }, [addToast, translateIncomingToast])
+
+    const globalEventSubscription = useMemo(() => getAppGlobalSseSubscription(), [])
+    const sessionEventSubscription = useMemo(
+        () => getAppSessionSseSubscription(selectedSessionId),
+        [selectedSessionId]
+    )
+    const sseEnabled = Boolean(api && token)
+    const showReconnectingBanner = sseDisconnected && !isSyncing
+
+    const { subscriptionId: globalSubscriptionId } = useSSE({
+        enabled: sseEnabled,
+        token: token ?? '',
+        baseUrl,
+        subscription: globalEventSubscription,
+        scope: 'global',
+        onConnect: handleSseConnect,
+        onDisconnect: handleSseDisconnect,
+        onEvent: () => {},
+        onToast: handleToast
+    })
+
+    const { subscriptionId: sessionSubscriptionId } = useSSE({
+        enabled: sseEnabled && Boolean(sessionEventSubscription),
+        token: token ?? '',
+        baseUrl,
+        subscription: sessionEventSubscription ?? undefined,
+        scope: 'full',
+        onConnect: handleSessionSseConnect,
+        onEvent: handleSseEvent
+    })
+
+    useVisibilityReporter({
+        api,
+        subscriptionId: globalSubscriptionId,
+        enabled: sseEnabled
+    })
+
+    useVisibilityReporter({
+        api,
+        subscriptionId: sessionSubscriptionId,
+        enabled: sseEnabled && Boolean(sessionEventSubscription)
+    })
+
+    // Loading auth source
+    if (isAuthSourceLoading) {
+        return withPwaBanner(
+            <div className="h-full flex items-center justify-center p-4">
+                <LoadingState label={t('loading')} className="text-sm" />
+            </div>,
+        )
+    }
+
+    // No auth source (browser environment, not logged in)
+    if (!authSource) {
+        return withPwaBanner(
+            <LoginPrompt
+                onLogin={setAccessToken}
+                baseUrl={baseUrl}
+                serverUrl={serverUrl}
+                setServerUrl={setServerUrl}
+                clearServerUrl={clearServerUrl}
+                requireServerUrl={REQUIRE_SERVER_URL}
+            />,
+        )
+    }
+
+    if (needsBinding) {
+        return withPwaBanner(
+            <LoginPrompt
+                mode="bind"
+                onBind={bind}
+                baseUrl={baseUrl}
+                serverUrl={serverUrl}
+                setServerUrl={setServerUrl}
+                clearServerUrl={clearServerUrl}
+                requireServerUrl={REQUIRE_SERVER_URL}
+                error={authError ?? undefined}
+            />,
+        )
+    }
+
+    // Authenticating (also covers the gap before useAuth effect starts)
+    if (isAuthLoading || (authSource && !token && !authError)) {
+        return withPwaBanner(
+            <div className="h-full flex items-center justify-center p-4">
+                <LoadingState label={t('authorizing')} className="text-sm" />
+            </div>,
+        )
+    }
+
+    // Auth error
+    if (authError || !token || !api) {
+        // If using access token and auth failed, show login again
+        if (authSource.type === 'accessToken') {
+            return withPwaBanner(
+                <LoginPrompt
+                    onLogin={setAccessToken}
+                    baseUrl={baseUrl}
+                    serverUrl={serverUrl}
+                    setServerUrl={setServerUrl}
+                    clearServerUrl={clearServerUrl}
+                    requireServerUrl={REQUIRE_SERVER_URL}
+                    error={authError ?? t('login.error.authFailed')}
+                />,
+            )
+        }
+
+        // Telegram auth failed
+        return withPwaBanner(
+            <div className="p-4 space-y-3">
+                <div className="text-base font-semibold">{t('login.title')}</div>
+                <div className="text-sm text-red-600">
+                    {authError ?? t('login.error.authFailed')}
+                </div>
+                <div className="text-xs text-[var(--app-hint)]">
+                    Open this page from Telegram using the bot's "Open App" button (not "Open in browser").
+                </div>
+            </div>,
+        )
+    }
+
+    return (
+        <AppContextProvider value={{ api, token, baseUrl, titleSuggestionAvailable }}>
+            <VoiceProvider>
+                <PwaUpdateBannerWithStatusOffset
+                    isSyncing={isSyncing}
+                    isReconnecting={showReconnectingBanner}
+                />
+                <SyncingBanner isSyncing={isSyncing} />
+                <ReconnectingBanner
+                    isReconnecting={showReconnectingBanner}
+                    reason={sseDisconnectReason}
+                />
+                <VoiceErrorBanner />
+                <OfflineBanner
+                    isHubConnected={globalSubscriptionId !== null}
+                    isReconnecting={showReconnectingBanner}
+                />
+                <RunnerVersionSkewBanner />
+                <div className="h-full min-h-0 flex flex-col">
+                    <Outlet />
+                </div>
+                <ToastContainer />
+                <InstallPrompt />
+            </VoiceProvider>
+        </AppContextProvider>
+    )
+}

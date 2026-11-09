@@ -1,0 +1,220 @@
+#!/usr/bin/env bun
+/**
+ * Post a local file to a HAPI session via display_image / display_video / display_media MCP.
+ *
+ * Uses session.metadata.hapiMcpUrl (published at MCP server start) so we hit the MCP
+ * endpoint, not the session hook server on another loopback port in the same process.
+ *
+ * Usage:
+ *   # inside a wrapped session (self-targets via $HAPI_SESSION_ID — no list):
+ *   bun scripts/tooling/hapi-display-image.mjs <media-path> [title]
+ *   # explicit self:
+ *   bun scripts/tooling/hapi-display-image.mjs self <media-path> [title]
+ *   # explicit other session:
+ *   bun scripts/tooling/hapi-display-image.mjs <session-id-prefix> <media-path> [title]
+ *
+ * Self-resolution (tiann/hapi#1119): $HAPI_SESSION_ID → GET /api/sessions/:id directly.
+ * Picks the strict image/video tool when recognized, else display_media.
+ * Prefer the MCP tools when available; this script is the shell fallback.
+ */
+
+import { closeSync, openSync, readSync, readFileSync, lstatSync } from 'node:fs'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+
+const HAPI_HOST = process.env.HAPI_HOST ?? 'http://localhost:3006'
+const SETTINGS = process.env.HAPI_SETTINGS ?? `${process.env.HOME}/.hapi/settings.json`
+
+const SELF_TOKENS = new Set(['self', '@self', '@me', 'current', '-'])
+
+function isFile(p) {
+    try {
+        return lstatSync(p).isFile()
+    } catch {
+        return false
+    }
+}
+
+function sessionMatchesPrefix(session, prefix) {
+    if (typeof session.id === 'string' && session.id.startsWith(prefix)) {
+        return true
+    }
+    const meta = session.metadata ?? {}
+    const agentIds = [
+        meta.agentSessionId,
+        meta.cursorSessionId,
+        meta.codexSessionId,
+        meta.claudeSessionId,
+        meta.geminiSessionId,
+        meta.opencodeSessionId,
+        meta.kimiSessionId,
+    ]
+    return agentIds.some((id) => typeof id === 'string' && id.startsWith(prefix))
+}
+
+function readHeader(path, length = 16) {
+    const fd = openSync(path, 'r')
+    try {
+        const head = Buffer.alloc(length)
+        const bytesRead = readSync(fd, head, 0, head.length, 0)
+        return head.subarray(0, bytesRead)
+    } finally {
+        closeSync(fd)
+    }
+}
+
+function detectMediaTool(path) {
+    // EBML DocType can sit well past the first 16 bytes; match generatedImages scan window.
+    const head = readHeader(path, 128)
+    if (head.length >= 12 && head.subarray(4, 8).toString('ascii') === 'ftyp') {
+        const brand = head.subarray(8, 12).toString('ascii')
+        if (brand === 'avif' || brand === 'avis') return 'display_image'
+        return 'display_media'
+    }
+    if (head.length >= 4 && head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) {
+        // EBML is shared by WebM and Matroska — only route DocType "webm" to video.
+        const limit = Math.min(head.length, 128)
+        for (let i = 4; i + 3 < limit; i += 1) {
+            if (head[i] !== 0x42 || head[i + 1] !== 0x82) continue
+            const sizeByte = head[i + 2]
+            if ((sizeByte & 0x80) === 0) continue
+            const len = sizeByte & 0x7f
+            if (len === 0 || i + 3 + len > limit) continue
+            const docType = head.subarray(i + 3, i + 3 + len).toString('ascii')
+            if (docType === 'webm') return 'display_video'
+            break
+        }
+        return 'display_media'
+    }
+    if (head.length >= 8 && head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'display_image'
+    if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return 'display_image'
+    if (head.length >= 6 && ['GIF87a', 'GIF89a'].includes(head.subarray(0, 6).toString('ascii'))) return 'display_image'
+    if (head.length >= 12 && head.subarray(0, 4).toString('ascii') === 'RIFF' && head.subarray(8, 12).toString('ascii') === 'WEBP') return 'display_image'
+    return 'display_media'
+}
+
+// Arg shapes (backward compatible):
+//   <media> [title]                     → self-target current session
+//   <self-token> <media> [title]        → self-target, explicit
+//   <session-id-prefix> <media> [title] → explicit session
+const args = process.argv.slice(2)
+let sessionArg
+let imagePath
+let title
+if (args.length > 0 && isFile(args[0]) && !SELF_TOKENS.has(args[0])) {
+    sessionArg = null
+    imagePath = args[0]
+    title = args[1]
+} else {
+    sessionArg = args[0]
+    imagePath = args[1]
+    title = args[2]
+}
+
+if (!imagePath) {
+    console.error('usage: hapi-display-image.mjs [<session-id-prefix>|self] <media-path> [title]')
+    console.error('  or: HAPI_SESSION_ID=<uuid> hapi-display-image.mjs <media-path> [title]')
+    process.exit(2)
+}
+
+if (!isFile(imagePath)) {
+    console.error(`not a file: ${imagePath}`)
+    process.exit(2)
+}
+
+const token = process.env.CLI_API_TOKEN ?? JSON.parse(readFileSync(SETTINGS, 'utf8')).cliApiToken
+if (!token) {
+    console.error('missing CLI_API_TOKEN env and no cliApiToken in settings')
+    process.exit(2)
+}
+const authRes = await fetch(`${HAPI_HOST}/api/auth`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ accessToken: token }),
+})
+if (!authRes.ok) {
+    console.error('auth failed', authRes.status)
+    process.exit(3)
+}
+const { token: jwt } = await authRes.json()
+const authHeaders = { Authorization: `Bearer ${jwt}` }
+
+async function fetchSessionDetail(sessionId) {
+    const detailRes = await fetch(`${HAPI_HOST}/api/sessions/${encodeURIComponent(sessionId)}`, {
+        headers: authHeaders,
+    })
+    if (!detailRes.ok) {
+        return null
+    }
+    const detailBody = await detailRes.json()
+    return detailBody.session ?? detailBody
+}
+
+async function listSessions() {
+    const sessionsRes = await fetch(`${HAPI_HOST}/api/sessions?limit=500`, {
+        headers: authHeaders,
+    })
+    const sessionsBody = await sessionsRes.json()
+    return sessionsBody.sessions ?? sessionsBody
+}
+
+let session
+const wantsSelf = !sessionArg || SELF_TOKENS.has(sessionArg)
+const hapiSessionId = process.env.HAPI_SESSION_ID?.trim()
+
+if (wantsSelf) {
+    if (!hapiSessionId) {
+        console.error(
+            'cannot self-resolve session: $HAPI_SESSION_ID is not set. '
+            + 'Pass an explicit <session-id-prefix>, or run inside a HAPI-wrapped agent session.',
+        )
+        process.exit(4)
+    }
+    // Preferred path (#1119): direct GET, no /api/sessions list.
+    session = await fetchSessionDetail(hapiSessionId)
+    if (!session) {
+        console.error(`GET /api/sessions/${hapiSessionId} failed (HAPI_SESSION_ID set but hub has no such row)`)
+        process.exit(4)
+    }
+} else {
+    // Explicit id/prefix: full uuid → direct GET; otherwise list + prefix match
+    // (HAPI id or agent session ids such as cursorSessionId).
+    const looksFull = /^[0-9a-f-]{36}$/i.test(sessionArg)
+    if (looksFull) {
+        session = await fetchSessionDetail(sessionArg)
+    }
+    if (!session) {
+        const sessions = await listSessions()
+        const matches = sessions.filter((candidate) => sessionMatchesPrefix(candidate, sessionArg))
+        if (matches.length !== 1) {
+            console.error(
+                matches.length === 0
+                    ? `no session for prefix ${sessionArg} (use HAPI session id from /sessions/<uuid>, not cursorSessionId alone)`
+                    : `ambiguous session prefix ${sessionArg} (${matches.length} matches); use a full HAPI session id`,
+            )
+            process.exit(4)
+        }
+        const listed = matches[0]
+        // List summaries may omit hapiMcpUrl; detail fetch always has it when present.
+        session = await fetchSessionDetail(listed.id) ?? listed
+    }
+}
+
+const mcpUrl = session.metadata?.hapiMcpUrl
+if (!mcpUrl) {
+    console.error('session has no hapiMcpUrl metadata (restart session CLI after MCP server start)')
+    process.exit(5)
+}
+
+console.error(`hapi-display-image: session=${session.id} mcp=${mcpUrl}`)
+
+const mediaTool = detectMediaTool(imagePath)
+const client = new Client({ name: 'hapi-display-image', version: '1.0.0' }, { capabilities: {} })
+const transport = new StreamableHTTPClientTransport(new URL(mcpUrl))
+await client.connect(transport)
+const result = await client.callTool({
+    name: mediaTool,
+    arguments: { path: imagePath, title: title ?? undefined },
+})
+await client.close()
+console.log(JSON.stringify(result, null, 2))

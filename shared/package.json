@@ -1,0 +1,40 @@
+{
+    "name": "@hapi/protocol",
+    "private": true,
+    "version": "0.1.0",
+    "type": "module",
+    "main": "./src/index.ts",
+    "types": "./src/index.ts",
+    "exports": {
+        ".": "./src/index.ts",
+        "./apiTypes": "./src/apiTypes.ts",
+        "./messages": "./src/messages.ts",
+        "./slashCommands": "./src/slashCommands.ts",
+        "./buildInfo": "./src/buildInfo.ts",
+        "./conversationHistory": "./src/conversationHistory.ts",
+        "./modes": "./src/modes.ts",
+        "./rpcMethods": "./src/rpcMethods.ts",
+        "./runnerCapabilities": "./src/runnerCapabilities.ts",
+        "./schemas": "./src/schemas.ts",
+        "./sessionCitation": "./src/sessionCitation.ts",
+        "./sessionExport": "./src/sessionExport.ts",
+        "./types": "./src/types.ts",
+        "./voice": "./src/voice.ts",
+        "./voicePickerCatalog": "./src/voicePickerCatalog.ts",
+        "./voice-personality": "./src/voicePersonality.ts",
+        "./usage": "./src/usage.ts",
+        "./settingsFileLock": "./src/settingsFileLock.ts",
+        "./agentCliSpawnLease": "./src/agentCliSpawnLease.ts"
+    },
+    "sideEffects": false,
+    "scripts": {
+        "test": "bun test"
+    },
+    "dependencies": {
+        "proper-lockfile": "^4.1.2",
+        "zod": "^4.2.1"
+    },
+    "devDependencies": {
+        "@types/proper-lockfile": "^4.1.4"
+    }
+}
